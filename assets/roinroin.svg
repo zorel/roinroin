@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2a2350"/>
+      <stop offset="1" stop-color="#14161f"/>
+    </linearGradient>
+    <linearGradient id="bubble" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9a70ff"/>
+      <stop offset="1" stop-color="#6c48e8"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="52" fill="url(#bg)"/>
+  <path d="M62 58h132a18 18 0 0 1 18 18v78a18 18 0 0 1-18 18h-70l-34 28v-28H62a18 18 0 0 1-18-18V76a18 18 0 0 1 18-18z" fill="url(#bubble)"/>
+  <path d="M74 108c14-18 32-27 54-27 20 0 37 7 51 21l-13 13c-11-11-24-16-38-16-16 0-29 6-40 18z" fill="#ffffff" opacity=".92"/>
+  <circle cx="104" cy="126" r="7" fill="#14161f"/>
+  <circle cx="152" cy="126" r="7" fill="#14161f"/>
+  <path d="M112 148c10 8 22 8 32 0" fill="none" stroke="#14161f" stroke-width="6" stroke-linecap="round"/>
+  <path d="M176 170l26 12-26 12z" fill="#ffc440"/>
+  <path d="M198 176l30 6-30 8z" fill="#ff9d2e"/>
+</svg>

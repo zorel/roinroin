@@ -1,0 +1,52 @@
+# roinroin — exemple de configuration
+#
+# Emplacement : ${XDG_CONFIG_HOME:-~/.config}/roinroin/config.toml
+# L'état (dernier post lu, tribunes connues) est dans
+# ${XDG_DATA_HOME:-~/.local/share}/roinroin/state.json.
+
+nickname = "dave"
+selected_boards = ["devnewton", "gabuzomeu"]
+hidden_tribunes = []
+totoz_server = "https://nsfw.totoz.eu"
+blocked = []
+blocked_mode = "gray"          # "gray" ou "hide"
+plop_list = ["troll"]         # auteurs remplacés par pika/plop/prout/grouik/meuh
+theme = "dark"                 # "dark", "light" ou "system"
+language = "french"            # conservé pour la traduction à venir
+draft = ""
+last_posted = ""
+show_hidden = false
+history_limit = 2000
+hourly_bell = false
+
+# Plusieurs serveurs gb2c peuvent être suivis en même temps que les boards
+# directs. Chaque serveur a son propre flux SSE.
+[[servers]]
+name = "local"
+url = "http://localhost:16666"
+enabled = true
+
+# [[servers]]
+# name = "autre"
+# url = "https://gb2c.example.org"
+# enabled = true
+
+[notifications]
+enabled = true
+all_posts = false
+bigorno = true
+replies = true
+only_unfocused = true
+
+# Boards lus et écrits directement, sans gb2c. Les boards prédéfinis
+# (dlfp, euromussels, gabuzomeu, moules, devnewton, ototu, reveildutroll,
+# sveetch) n'ont pas besoin d'être recopiés ici : il suffit de les mettre dans
+# selected_boards. Cette section ne sert qu'aux boards personnalisés.
+#
+# [[custom_boards]]
+# name = "mon-board"
+# backend_url = "https://example.org/board/backend.tsv"
+# post_url = "https://example.org/board/add.php"
+# post_field = "message"
+# info_field = ""
+# auth = "none"                # ou "oauth2" pour LinuxFR

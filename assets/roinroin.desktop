@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=roinroin
+GenericName=Tribune client
+GenericName[fr]=Client de tribune
+Comment=Native client for gb2c and direct bouchot boards
+Comment[fr]=Client natif pour gb2c et les boards bouchot directs
+Exec=roinroin
+Icon=roinroin
+Terminal=false
+Categories=Network;Chat;InstantMessaging;
+Keywords=tribune;bouchot;gb3;gb2c;coincoin;linuxfr;chat;
+StartupNotify=true
+StartupWMClass=roinroin
