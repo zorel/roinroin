@@ -130,7 +130,10 @@ pub fn analyze(
     // Parse every message once, and resolve its references.
     let mut parsed_by_key: HashMap<PostKey, ParsedMessage> = HashMap::new();
     for (key, post) in posts {
-        parsed_by_key.insert(key.clone(), message::parse(&post.message));
+        parsed_by_key.insert(
+            key.clone(),
+            message::parse_with_identities(&post.message, my_identities),
+        );
     }
 
     let mut resolved_by_key: HashMap<PostKey, Vec<ResolvedRef>> = HashMap::new();
@@ -564,6 +567,27 @@ mod tests {
                 .unwrap(),
         );
         assert!(analysis.posts[&b].hidden);
+    }
+
+    #[test]
+    fn marks_bigornos_for_own_identities_with_dots_and_spaces() {
+        let mut posts = BTreeMap::new();
+        let (dotted, dotted_post) = post("t", 1, "20240629120000", "bob", "my.nick< look at this");
+        let (spaced, spaced_post) = post("t", 2, "20240629120100", "bob", "Big Nick< et voilà");
+        posts.insert(dotted.clone(), dotted_post);
+        posts.insert(spaced.clone(), spaced_post);
+        let identities = BTreeSet::from(["my.nick".to_owned(), "Big Nick".to_owned()]);
+        let analysis = analyze(
+            &posts,
+            &BTreeSet::new(),
+            &identities,
+            chrono::NaiveDate::from_ymd_opt(2024, 6, 29)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap(),
+        );
+        assert!(analysis.posts[&dotted].is_bigorno);
+        assert!(analysis.posts[&spaced].is_bigorno);
     }
 
     #[test]

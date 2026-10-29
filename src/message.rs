@@ -83,6 +83,12 @@ impl ParsedMessage {
 }
 
 pub fn parse(message: &str) -> ParsedMessage {
+    parse_with_identities(message, &BTreeSet::new())
+}
+
+/// Like [`parse`], but also recognizes the given identities as bigornos even
+/// when they contain spaces or punctuation that the generic scanner rejects.
+pub fn parse_with_identities(message: &str, identities: &BTreeSet<String>) -> ParsedMessage {
     let cleaned = clean(message);
     let source = expand_anchors(&cleaned);
     let mut tokens: Vec<Token> = Vec::new();
@@ -182,8 +188,10 @@ pub fn parse(message: &str) -> ParsedMessage {
             }
         }
 
-        if (index == 0 || is_message_whitespace(bytes[index])) && code != '\n' {
-            if let Some(found) = match_bigorno(&source, index) {
+        if code != '\n' && is_bigorno_boundary(bytes, index) {
+            if let Some(found) = match_identity_bigorno(&source, index, identities)
+                .or_else(|| match_bigorno(&source, index))
+            {
                 flush(&mut tokens, &mut text, style, active_spoiler);
                 if let Some(spaces) = found.leading {
                     if let Some(Token::Text { text: previous, .. }) = tokens.last_mut() {
@@ -397,6 +405,17 @@ fn is_message_whitespace(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
 }
 
+/// A bigorno can start at the beginning of the message, after whitespace
+/// (including a newline) or directly after a BML tag.
+fn is_bigorno_boundary(bytes: &[u8], index: usize) -> bool {
+    if index == 0 || is_message_whitespace(bytes[index]) {
+        return true;
+    }
+    bytes
+        .get(index - 1)
+        .is_some_and(|byte| is_message_whitespace(*byte) || *byte == b'>')
+}
+
 struct BigornoMatch {
     end: usize,
     leading: Option<&'static str>,
@@ -405,7 +424,6 @@ struct BigornoMatch {
 
 fn match_bigorno(message: &str, index: usize) -> Option<BigornoMatch> {
     let bytes = message.as_bytes();
-    let start = index;
     let mut cursor = index;
     let mut leading = None;
     if cursor < bytes.len() && is_message_whitespace(bytes[cursor]) {
@@ -419,15 +437,61 @@ fn match_bigorno(message: &str, index: usize) -> Option<BigornoMatch> {
     if cursor == word_start {
         return None;
     }
-    let word = &message[word_start..cursor];
-    let (after, marker_len) = if message[cursor..].starts_with('<') {
-        (cursor + 1, 1)
+    let after = bigorno_end(message, cursor)?;
+    Some(BigornoMatch {
+        end: after,
+        leading,
+        word: message[word_start..cursor].to_owned(),
+    })
+}
+
+/// Match a known identity followed by `<`, so logins and user agents that
+/// contain spaces, dots or other punctuation are recognized as bigornos.
+fn match_identity_bigorno(
+    message: &str,
+    index: usize,
+    identities: &BTreeSet<String>,
+) -> Option<BigornoMatch> {
+    if identities.is_empty() {
+        return None;
+    }
+    let bytes = message.as_bytes();
+    let mut cursor = index;
+    let mut leading = None;
+    if cursor < bytes.len() && is_message_whitespace(bytes[cursor]) {
+        leading = Some(" ");
+        cursor += 1;
+    }
+    let mut best: Option<(usize, usize)> = None;
+    for identity in identities {
+        if identity.is_empty() || !message[cursor..].starts_with(identity.as_str()) {
+            continue;
+        }
+        let end = cursor + identity.len();
+        let Some(after) = bigorno_end(message, end) else {
+            continue;
+        };
+        if best.is_none_or(|(length, _)| identity.len() > length) {
+            best = Some((identity.len(), after));
+        }
+    }
+    let (length, after) = best?;
+    Some(BigornoMatch {
+        end: after,
+        leading,
+        word: message[cursor..cursor + length].to_owned(),
+    })
+}
+
+/// Returns the end of the bigorno marker at `cursor`, if any.
+fn bigorno_end(message: &str, cursor: usize) -> Option<usize> {
+    let after = if message[cursor..].starts_with('<') {
+        cursor + 1
     } else if message[cursor..].starts_with("&lt;") {
-        (cursor + 4, 4)
+        cursor + 4
     } else {
         return None;
     };
-    let _ = marker_len;
     if after < message.len() {
         let next = message[after..].chars().next()?;
         if !(is_message_whitespace(next as u8)
@@ -441,16 +505,11 @@ fn match_bigorno(message: &str, index: usize) -> Option<BigornoMatch> {
             return None;
         }
     }
-    let _ = start;
-    Some(BigornoMatch {
-        end: after,
-        leading,
-        word: word.to_owned(),
-    })
+    Some(after)
 }
 
 fn is_bigorno_char(character: char) -> bool {
-    character.is_ascii_alphanumeric() || character == '-' || character == '_'
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
 }
 
 fn match_norloge(message: &str, index: usize) -> Option<(NorlogeRef, usize)> {
@@ -853,6 +912,60 @@ mod tests {
             .tokens
             .iter()
             .any(|token| matches!(token, Token::Bigorno { word } if word == "dave")));
+    }
+
+    #[test]
+    fn parses_bigorno_with_dot() {
+        let parsed = parse("my.nick< hello");
+        assert!(parsed.bigornos.contains("my.nick"));
+        assert!(parsed
+            .tokens
+            .iter()
+            .any(|token| matches!(token, Token::Bigorno { word } if word == "my.nick")));
+    }
+
+    #[test]
+    fn parses_identity_bigorno_with_spaces() {
+        let identities = BTreeSet::from([
+            "Big Nick".to_owned(),
+            "Mozilla/5.0 (X11; Linux x86_64) Firefox/127.0".to_owned(),
+        ]);
+
+        let parsed = parse_with_identities("hello Big Nick< how are you", &identities);
+        assert!(parsed.has_bigorno(&identities));
+        assert!(parsed
+            .tokens
+            .iter()
+            .any(|token| matches!(token, Token::Bigorno { word } if word == "Big Nick")));
+
+        let ua = "Mozilla/5.0 (X11; Linux x86_64) Firefox/127.0<";
+        let parsed = parse_with_identities(ua, &identities);
+        assert!(parsed.has_bigorno(&identities));
+        assert!(parsed
+            .bigornos
+            .contains("Mozilla/5.0 (X11; Linux x86_64) Firefox/127.0"));
+    }
+
+    #[test]
+    fn parses_bigornos_after_newline_and_tags() {
+        let identities = BTreeSet::from(["Big Nick".to_owned()]);
+
+        let parsed = parse("hello\nmy.nick< how are you");
+        assert!(parsed.bigornos.contains("my.nick"));
+
+        let parsed = parse_with_identities("<b>Big Nick<</b> hi", &identities);
+        assert!(parsed.has_bigorno(&identities));
+        assert!(parsed
+            .tokens
+            .iter()
+            .any(|token| matches!(token, Token::Bigorno { word } if word == "Big Nick")));
+    }
+
+    #[test]
+    fn identity_without_marker_is_not_a_bigorno() {
+        let identities = BTreeSet::from(["Big Nick".to_owned()]);
+        let parsed = parse_with_identities("hello Big Nick", &identities);
+        assert!(!parsed.has_bigorno(&identities));
     }
 
     #[test]

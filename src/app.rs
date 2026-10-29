@@ -45,8 +45,16 @@ pub struct ServerState {
     pub known: BTreeSet<String>,
     pub blocked: BTreeSet<String>,
     pub connected: bool,
+    pub fetching: bool,
     pub last_error: Option<String>,
     pub last_event: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionStatus {
+    Online,
+    Error,
+    Working,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -232,6 +240,7 @@ pub enum Message {
     Scrolled(f32),
     Composer(String),
     Insert(String),
+    TotozPicked(String),
     Send,
     FlushSse,
     CursorMoved(Point),
@@ -314,6 +323,7 @@ pub struct App {
     pub(crate) reveal: HashSet<(PostKey, usize)>,
     pub(crate) scroll_to_bottom: bool,
     pub(crate) posts_scroll_id: Id,
+    pub(crate) composer_id: Id,
     pub(crate) linuxfr_refreshing: bool,
     pub(crate) sse_epoch: u64,
     pub(crate) linuxfr_retry_at: Option<Instant>,
@@ -382,6 +392,7 @@ impl App {
             reveal: HashSet::new(),
             scroll_to_bottom: true,
             posts_scroll_id: Id::new("roinroin-posts"),
+            composer_id: Id::new("roinroin-composer"),
             linuxfr_refreshing: false,
             sse_epoch: 0,
             linuxfr_retry_at: None,
@@ -624,12 +635,14 @@ impl App {
                                     known: BTreeSet::new(),
                                     blocked: BTreeSet::new(),
                                     connected: false,
+                                    fetching: false,
                                     last_error: None,
                                     last_event: None,
                                 });
                         state.known = info.tribunes.into_iter().collect();
                         state.blocked = info.blocked;
                         state.connected = true;
+                        state.fetching = false;
                         state.last_error = None;
                         state.last_event = Some(Instant::now());
                         self.persisted
@@ -646,6 +659,7 @@ impl App {
                     Err(error) => {
                         if let Some(state) = self.servers.get_mut(&url) {
                             state.connected = false;
+                            state.fetching = false;
                             state.last_error = Some(error.clone());
                         }
                         self.error = Some(format!("{url} : {error}"));
@@ -793,8 +807,7 @@ impl App {
                 if self.hovered_post.as_ref() == Some(&key) {
                     if let Some(post) = self.posts.get(&key) {
                         let quote = format!("{} ", quote_clock(post));
-                        self.composer.push_str(&quote);
-                        self.draft_dirty = true;
+                        tasks.push(self.insert_composer(&quote));
                     }
                 } else {
                     self.selected = Some(key);
@@ -865,8 +878,17 @@ impl App {
                 self.draft_dirty = true;
             }
             Message::Insert(text) => {
-                self.composer.push_str(&text);
-                self.draft_dirty = true;
+                tasks.push(self.insert_composer(&text));
+            }
+            Message::TotozPicked(name) => {
+                self.screen = Screen::Main;
+                self.hovered_totoz = None;
+                self.hovered_preview = None;
+                self.scroll_to_bottom = true;
+                tasks.push(self.insert_composer(&format!("[:{name}] ")));
+                tasks.push(iced::widget::operation::snap_to_end(
+                    self.posts_scroll_id.clone(),
+                ));
             }
             Message::Send => {
                 tasks.extend(self.send_message());
@@ -948,47 +970,48 @@ impl App {
                         self.totoz.results = results;
                         self.totoz.error = None;
                         let client = self.client.clone();
-                        let images: Vec<String> = self
+                        let requests: Vec<(String, String)> = self
                             .totoz
                             .results
                             .iter()
-                            .take(32)
-                            .map(|totoz| totoz.image.clone())
+                            .map(|totoz| (totoz.name.clone(), totoz.image.clone()))
                             .collect();
-                        let names: Vec<String> = self
-                            .totoz
-                            .results
-                            .iter()
-                            .take(32)
-                            .map(|totoz| totoz.name.clone())
-                            .collect();
-                        if !images.is_empty() {
+                        if !requests.is_empty() {
                             tasks.push(Task::perform(
                                 async move {
-                                    let mut output = Vec::with_capacity(images.len());
-                                    for (name, url) in names.into_iter().zip(images) {
-                                        let result = async {
-                                            let response = client
-                                                .get(&url)
-                                                .send()
-                                                .await
-                                                .map_err(|error| error.to_string())?;
-                                            if !response.status().is_success() {
-                                                return Err(format!("HTTP {}", response.status()));
+                                    futures::stream::iter(requests)
+                                        .map(|(name, url)| {
+                                            let client = client.clone();
+                                            async move {
+                                                let result = async {
+                                                    let response = client
+                                                        .get(&url)
+                                                        .timeout(Duration::from_secs(20))
+                                                        .send()
+                                                        .await
+                                                        .map_err(|error| error.to_string())?;
+                                                    if !response.status().is_success() {
+                                                        return Err(format!(
+                                                            "HTTP {}",
+                                                            response.status()
+                                                        ));
+                                                    }
+                                                    let bytes = response
+                                                        .bytes()
+                                                        .await
+                                                        .map_err(|error| error.to_string())?;
+                                                    if bytes.len() > 2 * 1024 * 1024 {
+                                                        return Err("image trop lourde".to_owned());
+                                                    }
+                                                    Ok(bytes.to_vec())
+                                                }
+                                                .await;
+                                                (name, result)
                                             }
-                                            let bytes = response
-                                                .bytes()
-                                                .await
-                                                .map_err(|error| error.to_string())?;
-                                            if bytes.len() > 2 * 1024 * 1024 {
-                                                return Err("image trop lourde".to_owned());
-                                            }
-                                            Ok(bytes.to_vec())
-                                        }
-                                        .await;
-                                        output.push((name, result));
-                                    }
-                                    output
+                                        })
+                                        .buffer_unordered(8)
+                                        .collect::<Vec<_>>()
+                                        .await
                                 },
                                 Message::TotozImages,
                             ));
@@ -1075,6 +1098,10 @@ impl App {
                 self.hovered_info = None;
                 self.hovered_totoz = None;
                 self.hovered_preview = None;
+                self.scroll_to_bottom = true;
+                tasks.push(iced::widget::operation::snap_to_end(
+                    self.posts_scroll_id.clone(),
+                ));
             }
             Message::Spoiler(key, spoiler) => {
                 if !self.reveal.insert((key.clone(), spoiler)) {
@@ -1300,7 +1327,14 @@ impl App {
         }
 
         self.ensure_analysis();
+        // Dispatch notifications before advancing the read marker: otherwise a
+        // post arriving in the active tribune could be marked as read before
+        // its bigorno/notification check, which silently suppressed it when
+        // the "only when unfocused" option was disabled.
         tasks.extend(self.dispatch_notifications());
+        if self.focused {
+            self.mark_active_read();
+        }
         Task::batch(tasks)
     }
 
@@ -1353,6 +1387,46 @@ impl App {
                 .map(|state| state.name.clone())
                 .unwrap_or_else(|| url.clone()),
             SourceId::Direct(name) => name.clone(),
+        }
+    }
+
+    pub fn server_status(&self, url: &str) -> ConnectionStatus {
+        let url = config::normalize_url(url).unwrap_or_else(|| url.to_owned());
+        let posting = self.sending
+            && self.active.as_ref().is_some_and(
+                |active| matches!(&active.source, SourceId::Gb2c(active_url) if active_url == &url),
+            );
+        let Some(state) = self.servers.get(&url) else {
+            return ConnectionStatus::Working;
+        };
+        if posting || state.fetching {
+            ConnectionStatus::Working
+        } else if state.last_error.is_some() {
+            ConnectionStatus::Error
+        } else if state.connected {
+            ConnectionStatus::Online
+        } else {
+            ConnectionStatus::Working
+        }
+    }
+
+    pub fn board_status(&self, name: &str) -> ConnectionStatus {
+        let posting = self.sending
+            && self
+                .active
+                .as_ref()
+                .is_some_and(|active| matches!(&active.source, SourceId::Direct(active_name) if active_name == name));
+        let Some(state) = self.boards.get(name) else {
+            return ConnectionStatus::Working;
+        };
+        if posting || state.fetching {
+            ConnectionStatus::Working
+        } else if state.last_error.is_some() {
+            ConnectionStatus::Error
+        } else if state.connected {
+            ConnectionStatus::Online
+        } else {
+            ConnectionStatus::Working
         }
     }
 
@@ -1493,9 +1567,6 @@ impl App {
             {
                 self.selected = None;
             }
-            if self.focused {
-                self.mark_active_read();
-            }
         }
     }
 
@@ -1543,6 +1614,7 @@ impl App {
                     known,
                     blocked: BTreeSet::new(),
                     connected: false,
+                    fetching: false,
                     last_error: None,
                     last_event: None,
                 });
@@ -1619,6 +1691,9 @@ impl App {
         let mut tasks = Vec::new();
         for server in self.config.servers.iter().filter(|server| server.enabled) {
             let url = config::normalize_url(&server.url).unwrap_or_else(|| server.url.clone());
+            if let Some(state) = self.servers.get_mut(&url) {
+                state.fetching = true;
+            }
             let client = self.client.clone();
             let request_url = url.clone();
             tasks.push(Task::perform(
@@ -1728,6 +1803,16 @@ impl App {
         vec![task]
     }
 
+    /// Append text to the composer and place the caret right after it, so the
+    /// user can keep typing without reaching for the entry field.
+    fn insert_composer(&mut self, text: &str) -> Task<Message> {
+        self.composer.push_str(text);
+        self.draft_dirty = true;
+        iced::widget::operation::focus(self.composer_id.clone()).chain(
+            iced::widget::operation::move_cursor_to_end(self.composer_id.clone()),
+        )
+    }
+
     fn handle_link(&mut self, action: LinkAction) -> Vec<Task<Message>> {
         match action {
             LinkAction::Url(url) => {
@@ -1751,9 +1836,15 @@ impl App {
                 vec![Task::done(Message::TotozSearch)]
             }
             LinkAction::Info(_, key) => {
-                self.selected = Some(key);
-                self.scroll_to_bottom = false;
-                Vec::new()
+                let Some(post) = self.posts.get(&key) else {
+                    return Vec::new();
+                };
+                let identity = post.identity();
+                if identity.is_empty() {
+                    return Vec::new();
+                }
+                let text = format!("{identity}<");
+                vec![self.insert_composer(&text)]
             }
             LinkAction::Unresolved(raw) => {
                 self.status = format!("norloge introuvable : {raw}");
@@ -2110,9 +2201,6 @@ impl App {
                 continue;
             }
             self.seen.insert(key.clone());
-            if !notifications.enabled || (notifications.only_unfocused && self.focused) {
-                continue;
-            }
             let Some(post) = self.posts.get(&key) else {
                 continue;
             };
@@ -2122,19 +2210,16 @@ impl App {
             if info.is_mine || info.hidden {
                 continue;
             }
+            let is_bigorno = info.is_bigorno;
+            let is_reply = info.is_reply;
+            if !notification_allowed(&notifications, self.focused, is_bigorno, is_reply) {
+                continue;
+            }
             if key.id <= self.last_read(&key.tribune) {
                 continue;
             }
             // Do not wake the user for history replayed after a reconnect.
             if post.time().age_seconds().is_some_and(|age| age > 180) {
-                continue;
-            }
-            let is_bigorno = info.is_bigorno;
-            let is_reply = info.is_reply;
-            if !(notifications.all_posts
-                || (notifications.bigorno && is_bigorno)
-                || (notifications.replies && is_reply))
-            {
                 continue;
             }
             let identity = post.display_identity();
@@ -2229,5 +2314,47 @@ fn keyboard_shortcut(event: keyboard::Event) -> Option<Message> {
     match event {
         keyboard::Event::KeyPressed { .. } => Some(Message::Keyboard(event)),
         _ => None,
+    }
+}
+
+fn notification_allowed(
+    notifications: &NotifyConfig,
+    focused: bool,
+    is_bigorno: bool,
+    is_reply: bool,
+) -> bool {
+    if !notifications.enabled {
+        return false;
+    }
+    // Bigornos are direct mentions: keep them even when the window is in the
+    // foreground, so a nick< is never missed.
+    if notifications.only_unfocused && focused && !is_bigorno {
+        return false;
+    }
+    notifications.all_posts
+        || (notifications.bigorno && is_bigorno)
+        || (notifications.replies && is_reply)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bigornos_notify_even_when_focused() {
+        let notifications = NotifyConfig::default();
+        assert!(notifications.only_unfocused);
+        assert!(notification_allowed(&notifications, true, true, false));
+        assert!(!notification_allowed(&notifications, true, false, true));
+        assert!(notification_allowed(&notifications, false, false, true));
+    }
+
+    #[test]
+    fn disabled_notifications_stay_disabled() {
+        let notifications = NotifyConfig {
+            enabled: false,
+            ..NotifyConfig::default()
+        };
+        assert!(!notification_allowed(&notifications, false, true, true));
     }
 }

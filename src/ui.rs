@@ -9,7 +9,7 @@ use iced::widget::{
 };
 use iced::{mouse, Alignment, Color, Element, Fill, Font, Length, Vector};
 
-use crate::app::{App, LinkAction, Message, Screen, SettingsMessage};
+use crate::app::{App, ConnectionStatus, LinkAction, Message, Screen, SettingsMessage};
 use crate::config::{BlockedMode, BoardAuth, ThemeMode};
 use crate::hover_text::HoverRich;
 use crate::message::Token;
@@ -136,20 +136,27 @@ fn main_view(app: &App) -> Element<'_, Message> {
 }
 
 fn sidebar(app: &App) -> Element<'_, Message> {
-    let mut gb2c_groups: BTreeMap<String, Vec<TribuneKey>> = BTreeMap::new();
+    let mut gb2c_groups: BTreeMap<String, (String, Vec<TribuneKey>)> = BTreeMap::new();
     let mut direct = Vec::new();
     for tribune in app.tribunes() {
         match &tribune.source {
             SourceId::Gb2c(url) => {
                 let label = format!("gb2c · {}", app.source_label(&SourceId::Gb2c(url.clone())));
-                gb2c_groups.entry(label).or_default().push(tribune);
+                gb2c_groups
+                    .entry(label)
+                    .or_insert_with(|| (url.clone(), Vec::new()))
+                    .1
+                    .push(tribune);
             }
             SourceId::Direct(_) => direct.push(tribune),
         }
     }
-    let mut groups: Vec<(String, Vec<TribuneKey>)> = gb2c_groups.into_iter().collect();
+    let mut groups: Vec<(String, Option<String>, Vec<TribuneKey>)> = gb2c_groups
+        .into_iter()
+        .map(|(label, (url, tribunes))| (label, Some(url), tribunes))
+        .collect();
     if !direct.is_empty() {
-        groups.push(("boards directs".to_owned(), direct));
+        groups.push(("boards directs".to_owned(), None, direct));
     }
 
     let mut list = column![].spacing(2).padding([10, 8]);
@@ -167,13 +174,17 @@ fn sidebar(app: &App) -> Element<'_, Message> {
             .padding(8),
         );
     }
-    for (group, tribunes) in groups {
-        list = list.push(
-            text(group.to_uppercase())
-                .size(10)
-                .style(colors::muted_text)
-                .width(Fill),
-        );
+    for (group, server_url, tribunes) in groups {
+        let mut header = row![text(group.to_uppercase())
+            .size(10)
+            .style(colors::muted_text)
+            .width(Fill)]
+        .align_y(Alignment::Center)
+        .width(Fill);
+        if let Some(status) = server_url.as_deref().map(|url| app.server_status(url)) {
+            header = header.push(status_icon(status));
+        }
+        list = list.push(container(header).padding([0, 8]).width(Fill));
         for tribune in tribunes {
             let active = app.is_active(&tribune);
             let (unread, bigorno, reply) = app.badges(&tribune);
@@ -191,12 +202,16 @@ fn sidebar(app: &App) -> Element<'_, Message> {
             if reply {
                 badges = badges.push(text("↩").size(12));
             }
+            let mut right = row![badges].align_y(Alignment::Center);
+            if let SourceId::Direct(name) = &tribune.source {
+                right = right.push(status_icon(app.board_status(name)));
+            }
             let label = row![
                 text(tribune.name.clone())
                     .size(14)
                     .width(Fill)
                     .wrapping(iced::widget::text::Wrapping::Word),
-                badges,
+                right,
             ]
             .align_y(Alignment::Center)
             .width(Fill);
@@ -212,6 +227,26 @@ fn sidebar(app: &App) -> Element<'_, Message> {
     }
 
     scrollable(list).height(Fill).into()
+}
+
+fn status_icon<'a>(status: ConnectionStatus) -> Element<'a, Message> {
+    let (glyph, color) = match status {
+        ConnectionStatus::Online => ("●", colors::SUCCESS),
+        ConnectionStatus::Error => ("✕", colors::DANGER),
+        ConnectionStatus::Working => ("●", colors::ACCENT),
+    };
+    container(
+        text(glyph)
+            .size(11)
+            .font(Font {
+                weight: iced::font::Weight::Bold,
+                ..Font::DEFAULT
+            })
+            .color(color),
+    )
+    .width(Length::Fixed(12.0))
+    .align_x(Alignment::Center)
+    .into()
 }
 
 fn content_view(app: &App) -> Element<'_, Message> {
@@ -394,7 +429,7 @@ fn post_card_body<'a>(
             weight: iced::font::Weight::Bold,
             ..Font::DEFAULT
         });
-    if !post.info.trim().is_empty() {
+    if !post.identity().is_empty() {
         identity_span = identity_span.link(LinkAction::Info(post.info.clone(), key.clone()));
     }
     let mut identity = HoverRich::with_spans(vec![identity_span])
@@ -615,6 +650,7 @@ fn composer(app: &App) -> Element<'_, Message> {
     };
 
     let editor = text_input(&hint, &app.composer)
+        .id(app.composer_id.clone())
         .on_input(Message::Composer)
         .on_submit(Message::Send)
         .size(14)
@@ -654,11 +690,19 @@ fn composer(app: &App) -> Element<'_, Message> {
 }
 
 fn icon_button<'a>(glyph: &'a str, message: Message) -> Element<'a, Message> {
-    button(text(glyph).size(16).style(colors::muted_text))
-        .on_press(message)
-        .style(colors::button_ghost)
-        .padding([1, 7])
-        .into()
+    button(
+        container(text(glyph).size(16).style(colors::muted_text))
+            .width(Fill)
+            .height(Fill)
+            .center_x(Fill)
+            .center_y(Fill),
+    )
+    .on_press(message)
+    .style(colors::button_ghost)
+    .width(Length::Fixed(30.0))
+    .height(Length::Fixed(28.0))
+    .padding(0)
+    .into()
 }
 
 // ---------------------------------------------------------------------------
@@ -830,7 +874,7 @@ fn settings_view(app: &App) -> Element<'_, Message> {
                 .on_toggle(|value| Message::Settings(SettingsMessage::NotifyEnabled(value)))
                 .size(16),
             checkbox(draft.notifications.only_unfocused)
-                .label("Seulement quand roinroin n'est pas au premier plan")
+                .label("Seulement quand roinroin n'est pas au premier plan (sauf bigornos)")
                 .on_toggle(|value| Message::Settings(SettingsMessage::NotifyOnlyUnfocused(value)))
                 .size(16),
         ]
@@ -1118,7 +1162,7 @@ fn totoz_view(app: &App) -> Element<'_, Message> {
                     .width(Length::Fixed(104.0))
                     .align_x(Alignment::Center),
                 )
-                .on_press(Message::Insert(format!("[:{}]", totoz.name)))
+                .on_press(Message::TotozPicked(totoz.name.clone()))
                 .style(colors::button_ghost)
                 .padding(4),
             );

@@ -128,6 +128,15 @@ impl Post {
             trim_identity(&short_browser_user_agent(&self.info), 24)
         }
     }
+
+    /// The login or user agent used to address this post with a bigorno.
+    pub fn identity(&self) -> &str {
+        if !self.login.trim().is_empty() {
+            self.login.trim()
+        } else {
+            self.info.trim()
+        }
+    }
 }
 
 /// A timestamp on a tribune. Bouchots use `yyyyMMddHHmmss` in Europe/Paris;
@@ -368,5 +377,21 @@ mod tests {
     #[test]
     fn trims_with_ellipsis() {
         assert_eq!(trim_identity("abcdefghij", 5), "abcd…");
+    }
+
+    #[test]
+    fn prefers_login_over_user_agent_for_identity() {
+        let mut post = Post {
+            id: 1,
+            time: String::new(),
+            info: " Mozilla/5.0 ".to_owned(),
+            login: " dave ".to_owned(),
+            message: String::new(),
+            tribune: String::new(),
+            source_label: String::new(),
+        };
+        assert_eq!(post.identity(), "dave");
+        post.login.clear();
+        assert_eq!(post.identity(), "Mozilla/5.0");
     }
 }

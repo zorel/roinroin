@@ -29,7 +29,9 @@ et reprend les fonctions des clients existants `gb3tui`, `gb3-android` et
 - envoi vers `/gb2c/post` ou directement vers l'URL de post du board ;
 - OAuth2 LinuxFR : ouverture de la page d'autorisation gb2c, collage du jeton
   de retour, rafraîchissement automatique du jeton ;
-- plusieurs serveurs gb2c configurables.
+- plusieurs serveurs gb2c configurables ;
+- pastilles d'état à droite de chaque serveur et board : vert connecté,
+  bleu en cours de connexion/rafraîchissement/envoi, rouge en erreur.
 
 ### Lecture des posts
 
@@ -74,13 +76,16 @@ et reprend les fonctions des clients existants `gb3tui`, `gb3-android` et
   suffixe `@tribune` quand on change de tribune ;
 - envoi par bouton, `Entrée` ou `Ctrl+Entrée`, restauration du brouillon si
   l'envoi échoue ;
-- insertion des totoz et emojis dans le brouillon.
+- insertion des totoz et emojis dans le brouillon ; choisir un totoz dans la
+  recherche revient à la tribune, l'insère avec un espace et place le curseur
+  juste après.
 
 ### Intégration Linux
 
 - **notifications de bureau** freedesktop.org via D-Bus (`notify-rust`) :
   bigorno, réponses à mes posts, ou tous les nouveaux posts ;
-- notification seulement quand la fenêtre n'est pas au premier plan (option) ;
+- notification seulement quand la fenêtre n'est pas au premier plan (option,
+  les bigornos sont toujours notifiés) ;
 - demande d'attention de la fenêtre pour les bigornos/réponses ;
 - fichier `.desktop`, icône hicolor et `make install` ;
 - thème sombre (palette gc2/gb3), clair ou détection système ;
