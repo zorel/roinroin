@@ -597,14 +597,10 @@ fn message_spans<'a>(
                     .as_ref()
                     .is_some_and(|target| highlighted_target == Some(target));
                 let mut value = span(reference.raw.as_str()).size(POST_FONT_SIZE);
+                // Keep the same font weight in both states: a bold span is
+                // wider and would shift the rest of the message on hover.
                 value = if highlighted {
-                    value
-                        .color(Color::WHITE)
-                        .background(colors::ACCENT)
-                        .font(Font {
-                            weight: iced::font::Weight::Bold,
-                            ..Font::DEFAULT
-                        })
+                    value.color(Color::WHITE).background(colors::ACCENT)
                 } else {
                     value.color(colors::CLOCK)
                 };
