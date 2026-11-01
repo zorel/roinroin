@@ -1221,6 +1221,71 @@ fn totoz_suggestion_term(text: &str) -> Option<&str> {
     Some(term)
 }
 
+/// Supported BML formatting tags, as recognized by the message scanner.
+const FORMATTING_TAGS: &[&str] = &[
+    "spoiler", "b", "strong", "i", "em", "s", "strike", "del", "u", "tt", "code",
+];
+
+/// Insert the matching closing tag as soon as the user completes an opening
+/// formatting tag. Only the inserted range is examined, so typing in the
+/// middle of the draft works and the caret naturally stays between both tags.
+fn auto_close_formatting_tag(previous: &str, current: &str) -> Option<String> {
+    if previous == current {
+        return None;
+    }
+    let prefix = previous
+        .chars()
+        .zip(current.chars())
+        .take_while(|(left, right)| left == right)
+        .map(|(character, _)| character.len_utf8())
+        .sum::<usize>();
+    let suffix = previous[prefix..]
+        .chars()
+        .rev()
+        .zip(current[prefix..].chars().rev())
+        .take_while(|(left, right)| left == right)
+        .map(|(character, _)| character.len_utf8())
+        .sum::<usize>();
+    let inserted_end = current.len().checked_sub(suffix)?;
+    if inserted_end <= prefix {
+        // Pure deletion.
+        return None;
+    }
+
+    let before = &current[..inserted_end];
+    let start = before.rfind('<')?;
+    let tag = &before[start..];
+    if !tag.ends_with('>') {
+        return None;
+    }
+    let name = &tag[1..tag.len() - 1];
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    let lower = name.to_ascii_lowercase();
+    if !FORMATTING_TAGS.contains(&lower.as_str()) {
+        return None;
+    }
+
+    let closing = format!("</{name}>");
+    if current[inserted_end..]
+        .to_ascii_lowercase()
+        .starts_with(&closing.to_ascii_lowercase())
+    {
+        return None;
+    }
+
+    let mut result = String::with_capacity(current.len() + closing.len());
+    result.push_str(&current[..inserted_end]);
+    result.push_str(&closing);
+    result.push_str(&current[inserted_end..]);
+    Some(result)
+}
+
 /// Search the configured totoz server, falling back to a gb2c relay when the
 /// server has no direct match. Shared by the totoz screen and the inline
 /// autocompletion.
@@ -1363,5 +1428,53 @@ mod tests {
             .map(|index| totoz(&format!("duck{index}")))
             .collect();
         assert_eq!(rank_totoz_suggestions(results, "duck", 8).len(), 8);
+    }
+
+    #[test]
+    fn completed_opening_tags_are_closed() {
+        assert_eq!(
+            auto_close_formatting_tag("<b", "<b>").as_deref(),
+            Some("<b></b>")
+        );
+        assert_eq!(
+            auto_close_formatting_tag("hello <spoiler", "hello <spoiler>").as_deref(),
+            Some("hello <spoiler></spoiler>")
+        );
+        assert_eq!(
+            auto_close_formatting_tag("<strong", "<strong>").as_deref(),
+            Some("<strong></strong>")
+        );
+        // Preserve the case the user typed.
+        assert_eq!(
+            auto_close_formatting_tag("<I", "<I>").as_deref(),
+            Some("<I></I>")
+        );
+    }
+
+    #[test]
+    fn completion_works_in_the_middle_of_the_draft() {
+        assert_eq!(
+            auto_close_formatting_tag("a <b c", "a <b> c").as_deref(),
+            Some("a <b></b> c")
+        );
+        assert_eq!(
+            auto_close_formatting_tag("<b><i", "<b><i>").as_deref(),
+            Some("<b><i></i>")
+        );
+    }
+
+    #[test]
+    fn completed_tags_are_not_closed_twice() {
+        assert_eq!(auto_close_formatting_tag("<b", "<b></b>"), None);
+        assert_eq!(auto_close_formatting_tag("<b</b>", "<b></b>"), None);
+    }
+
+    #[test]
+    fn unsupported_or_incomplete_tags_are_left_alone() {
+        assert_eq!(auto_close_formatting_tag("<br", "<br>"), None);
+        assert_eq!(auto_close_formatting_tag("<foo", "<foo>"), None);
+        assert_eq!(auto_close_formatting_tag("<b", "<b"), None);
+        assert_eq!(auto_close_formatting_tag("</b", "</b>"), None);
+        assert_eq!(auto_close_formatting_tag("hello", "hell"), None);
     }
 }

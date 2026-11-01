@@ -404,7 +404,7 @@ impl App {
                 self.sidebar_dragging = false;
             }
             Message::Composer(value) => {
-                self.composer = value;
+                self.composer = auto_close_formatting_tag(&self.composer, &value).unwrap_or(value);
                 self.draft_dirty = true;
                 tasks.extend(self.refresh_totoz_suggest());
             }

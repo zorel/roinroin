@@ -81,6 +81,9 @@ et reprend les fonctions des clients existants `gb3tui`, `gb3-android` et
   droite ; le nom de la tribune et sa source servent d'indication dans le champ
   vide ;
 - raccourcis `Alt+…` pour insérer les balises de formatage ;
+- fermeture automatique des balises : taper `<b>`, `<i>`, `<u>`, `<s>`,
+  `<tt>`, `<code>` ou `<spoiler>` insère aussitôt la balise fermante et laisse
+  le curseur entre les deux ;
 - citation d'un post au clic sur son horloge, avec bascule automatique du
   suffixe `@tribune` quand on change de tribune ;
 - envoi par bouton, `Entrée` ou `Ctrl+Entrée`, restauration du brouillon si
