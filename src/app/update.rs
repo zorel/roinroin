@@ -79,6 +79,7 @@ impl App {
                     }
                     window::Event::Unfocused => {
                         self.focused = false;
+                        self.shift_held = false;
                         self.config.draft = self.composer.clone();
                         self.persisted.active = self.active.as_ref().map(TribuneKey::key);
                         self.persisted.sidebar_width = self.sidebar_width;
@@ -103,6 +104,9 @@ impl App {
             }
             Message::Keyboard(event) => {
                 tasks.extend(self.handle_keyboard(event));
+            }
+            Message::ModifiersChanged(modifiers) => {
+                self.shift_held = modifiers.shift();
             }
             Message::ServerInfo(url, result) => {
                 let configured = self.config.servers.iter().any(|server| {
@@ -321,6 +325,24 @@ impl App {
                         tasks.push(self.insert_composer(&quote));
                     }
                 }
+            }
+            Message::PostRightClicked(key) => {
+                if self.shift_held {
+                    self.open_conversation(key);
+                }
+            }
+            Message::ConversationScrolled(anchor, at_bottom) => {
+                if let Some(pane) = self
+                    .conversations
+                    .iter_mut()
+                    .find(|pane| pane.anchor == anchor)
+                {
+                    pane.follow = at_bottom;
+                }
+            }
+            Message::CloseConversation(anchor) => {
+                self.conversations.retain(|pane| pane.anchor != anchor);
+                self.conversations_dirty = true;
             }
             Message::ClearSelection => {
                 self.selected = None;
@@ -917,7 +939,11 @@ impl App {
             Message::Noop => {}
         }
 
-        self.ensure_analysis();
+        let analysis_changed = self.ensure_analysis();
+        if analysis_changed || self.conversations_dirty {
+            self.refresh_conversations(&mut tasks);
+            self.conversations_dirty = false;
+        }
         // Dispatch notifications before advancing the read marker: otherwise a
         // post arriving in the active tribune could be marked as read before
         // its bigorno/notification check, which silently suppressed it when

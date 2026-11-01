@@ -24,7 +24,7 @@ use crate::config::{
 };
 use crate::conversation::{self, Analysis};
 use crate::message::{self, ParsedMessage, Token};
-use crate::model::{quote_clock, Post, PostKey, SourceId, TribuneKey};
+use crate::model::{compare_posts, quote_clock, Post, PostKey, SourceId, TribuneKey};
 use crate::net;
 use crate::notify;
 
@@ -146,6 +146,27 @@ impl TotozImage {
 pub struct EmojiState {
     pub query: String,
     pub results: Vec<net::Emoji>,
+}
+
+/// A conversation kept open next to the timeline. The whole thread is derived
+/// from the analysis on every render, so new replies appear automatically.
+#[derive(Debug, Clone)]
+pub struct ConversationPane {
+    /// Post that was right-clicked. The root is resolved again on every
+    /// analysis rebuild so a newly discovered ancestor does not detach the
+    /// pane from the rest of its thread.
+    pub anchor: PostKey,
+    /// Stay at the bottom when new messages arrive; turned off as soon as the
+    /// user scrolls up to read older posts.
+    pub follow: bool,
+    /// Latest post already seen in this pane, used to detect arrivals.
+    last: Option<PostKey>,
+}
+
+impl ConversationPane {
+    pub fn scroll_id(&self) -> Id {
+        Id::from(format!("roinroin-conversation:{}", self.anchor.key()))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -302,11 +323,15 @@ pub enum Message {
     Tick,
     WindowEvent(window::Id, window::Event),
     Keyboard(keyboard::Event),
+    ModifiersChanged(keyboard::Modifiers),
     ServerInfo(String, Result<net::ServerInfo, String>),
     BoardPosts(String, Result<Vec<Post>, String>),
     Sse(String, net::SseEvent),
     SelectTribune(TribuneKey),
     PostClicked(PostKey),
+    PostRightClicked(PostKey),
+    ConversationScrolled(PostKey, bool),
+    CloseConversation(PostKey),
     ClearSelection,
     JumpTo(PostKey),
     ToggleBlockedMode,
@@ -374,6 +399,9 @@ pub struct App {
     pub(crate) analysis_dirty: bool,
     pub(crate) active: Option<TribuneKey>,
     pub(crate) selected: Option<PostKey>,
+    pub(crate) conversations: Vec<ConversationPane>,
+    pub(crate) conversations_dirty: bool,
+    pub(crate) shift_held: bool,
     pub(crate) hovered_post: Option<PostKey>,
     pub(crate) hovered_link_post: Option<PostKey>,
     pub(crate) hovered_info: Option<String>,
@@ -453,6 +481,9 @@ impl App {
             analysis_dirty: true,
             active: None,
             selected: None,
+            conversations: Vec::new(),
+            conversations_dirty: false,
+            shift_held: false,
             hovered_post: None,
             hovered_link_post: None,
             hovered_info: None,
@@ -708,6 +739,16 @@ impl App {
         }
     }
 
+    /// Whether a post passes the same filters as the main timeline.
+    pub fn post_visible(&self, key: &PostKey) -> bool {
+        let hidden = self
+            .analysis
+            .info(key)
+            .map(|info| info.hidden)
+            .unwrap_or(false);
+        !hidden || self.config.show_hidden || self.config.blocked_mode == BlockedMode::Gray
+    }
+
     pub fn visible_keys(&self) -> Vec<PostKey> {
         let Some(active) = &self.active else {
             return Vec::new();
@@ -715,16 +756,94 @@ impl App {
         self.analysis
             .posts_for(active)
             .iter()
-            .filter(|key| {
-                let hidden = self
-                    .analysis
-                    .info(key)
-                    .map(|info| info.hidden)
-                    .unwrap_or(false);
-                !hidden || self.config.show_hidden || self.config.blocked_mode == BlockedMode::Gray
-            })
+            .filter(|key| self.post_visible(key))
             .cloned()
             .collect()
+    }
+
+    /// The visible posts of the whole discussion tree containing `key`,
+    /// oldest first.
+    pub fn conversation_keys(&self, key: &PostKey) -> Vec<PostKey> {
+        let mut keys: Vec<PostKey> = self
+            .analysis
+            .conversation(key)
+            .into_iter()
+            .filter(|key| self.post_visible(key))
+            .collect();
+        keys.sort_by(
+            |left, right| match (self.posts.get(left), self.posts.get(right)) {
+                (Some(left_post), Some(right_post)) => {
+                    compare_posts(left_post, right_post).then_with(|| left.cmp(right))
+                }
+                _ => left.cmp(right),
+            },
+        );
+        keys
+    }
+
+    /// Open the conversation containing `key`, unless that conversation is
+    /// already displayed in a pane.
+    pub(super) fn open_conversation(&mut self, key: PostKey) {
+        if self
+            .conversations
+            .iter()
+            .any(|pane| self.analysis.conversation(&pane.anchor).contains(&key))
+        {
+            return;
+        }
+        self.conversations.push(ConversationPane {
+            anchor: key,
+            follow: true,
+            last: None,
+        });
+        self.conversations_dirty = true;
+    }
+
+    /// Drop panes whose post disappeared, merge panes that now belong to the
+    /// same discussion tree, and keep the remaining ones following replies.
+    pub(super) fn refresh_conversations(&mut self, tasks: &mut Vec<Task<Message>>) {
+        let mut trees: Vec<BTreeSet<PostKey>> = Vec::new();
+        self.conversations.retain(|pane| {
+            if !self.posts.contains_key(&pane.anchor) {
+                return false;
+            }
+            if trees.iter().any(|members| members.contains(&pane.anchor)) {
+                return false;
+            }
+            trees.push(
+                self.analysis
+                    .conversation(&pane.anchor)
+                    .into_iter()
+                    .collect(),
+            );
+            true
+        });
+        let latest: Vec<(PostKey, Option<PostKey>)> = self
+            .conversations
+            .iter()
+            .map(|pane| {
+                (
+                    pane.anchor.clone(),
+                    self.conversation_keys(&pane.anchor).last().cloned(),
+                )
+            })
+            .collect();
+        for (anchor, latest) in latest {
+            let Some(pane) = self
+                .conversations
+                .iter_mut()
+                .find(|pane| pane.anchor == anchor)
+            else {
+                continue;
+            };
+            if pane.last == latest {
+                continue;
+            }
+            pane.last = latest;
+            if pane.follow {
+                tasks.push(iced::widget::operation::snap_to_end(pane.scroll_id()));
+            }
+        }
     }
 
     pub fn parsed_display(&self, key: &PostKey) -> Option<&ParsedMessage> {
@@ -1129,6 +1248,7 @@ async fn search_totoz_any(
 fn keyboard_shortcut(event: keyboard::Event) -> Option<Message> {
     match event {
         keyboard::Event::KeyPressed { .. } => Some(Message::Keyboard(event)),
+        keyboard::Event::ModifiersChanged(modifiers) => Some(Message::ModifiersChanged(modifiers)),
         _ => None,
     }
 }

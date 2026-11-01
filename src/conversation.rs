@@ -61,6 +61,34 @@ impl Analysis {
     pub fn max_id_for(&self, tribune: &TribuneKey) -> i64 {
         self.max_id.get(tribune).copied().unwrap_or(0)
     }
+
+    /// Identifier of the conversation containing `key`. Connected posts use
+    /// the shared root, so clicking any reply in a thread targets the same
+    /// conversation. An isolated post is its own root.
+    pub fn conversation_root(&self, key: &PostKey) -> PostKey {
+        self.info(key)
+            .and_then(|info| info.root.clone())
+            .unwrap_or_else(|| key.clone())
+    }
+
+    /// Every post connected to `key` through reply edges: ancestors up to the
+    /// root, every branch below it, and responses to responses. The order is
+    /// unspecified; callers sort by post time.
+    pub fn conversation(&self, key: &PostKey) -> Vec<PostKey> {
+        let mut members = BTreeSet::new();
+        let mut queue = vec![key.clone()];
+        while let Some(current) = queue.pop() {
+            if !members.insert(current.clone()) {
+                continue;
+            }
+            let Some(info) = self.posts.get(&current) else {
+                continue;
+            };
+            queue.extend(info.parents.iter().cloned());
+            queue.extend(info.children.iter().cloned());
+        }
+        members.into_iter().collect()
+    }
 }
 
 #[cfg(test)]
@@ -532,6 +560,115 @@ mod tests {
         let mut posts = BTreeMap::new();
         let (a, pa) = post("t", 1, "20240629120000", "dave", "hello");
         let (b, pb) = post("t", 2, "20240629120100", "bob", "12:00:00 hi");
+        let (c, pc) = post("t", 3, "20240629120200", "eve", "12:01:00 nested");
+        posts.insert(a.clone(), pa);
+        posts.insert(b.clone(), pb);
+        posts.insert(c.clone(), pc);
+        let analysis = analyze(
+            &posts,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            chrono::NaiveDate::from_ymd_opt(2024, 6, 29)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap(),
+        );
+        assert!(analysis.posts[&b].parents.contains(&a));
+        assert!(analysis.posts[&c].parents.contains(&b));
+        assert!(analysis.posts[&a].children.contains(&b));
+        assert_eq!(analysis.posts[&a].root, Some(a.clone()));
+        assert_eq!(analysis.posts[&b].root, Some(a.clone()));
+        assert_eq!(analysis.posts[&c].root, Some(a.clone()));
+        assert_eq!(analysis.conversation_root(&a), a);
+        assert_eq!(analysis.conversation_root(&b), a);
+        assert_eq!(analysis.conversation_root(&c), a);
+        assert_eq!(
+            analysis.conversation(&a),
+            vec![a.clone(), b.clone(), c.clone()]
+        );
+        assert_eq!(
+            analysis.conversation(&b),
+            vec![a.clone(), b.clone(), c.clone()]
+        );
+        assert_eq!(analysis.conversation(&c), vec![a, b, c]);
+    }
+
+    #[test]
+    fn conversation_includes_every_branch_from_any_post() {
+        let mut posts = BTreeMap::new();
+        let (root, root_post) = post("t", 1, "20240629120000", "dave", "root");
+        let (left, left_post) = post("t", 2, "20240629120100", "bob", "12:00:00 left");
+        let (right, right_post) = post("t", 3, "20240629120200", "eve", "12:00:00 right");
+        let (left_reply, left_reply_post) =
+            post("t", 4, "20240629120300", "bob", "12:01:00 deep left");
+        let (right_reply, right_reply_post) =
+            post("t", 5, "20240629120400", "eve", "12:02:00 deep right");
+        for (key, value) in [
+            (root.clone(), root_post),
+            (left.clone(), left_post),
+            (right.clone(), right_post),
+            (left_reply.clone(), left_reply_post),
+            (right_reply.clone(), right_reply_post),
+        ] {
+            posts.insert(key, value);
+        }
+        let analysis = analyze(
+            &posts,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            chrono::NaiveDate::from_ymd_opt(2024, 6, 29)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap(),
+        );
+        let expected = vec![
+            root.clone(),
+            left.clone(),
+            right.clone(),
+            left_reply.clone(),
+            right_reply.clone(),
+        ];
+        for key in &expected {
+            assert_eq!(analysis.conversation_root(key), root);
+            assert_eq!(analysis.conversation(key), expected);
+        }
+    }
+
+    #[test]
+    fn conversation_follows_posts_with_multiple_parents() {
+        let mut posts = BTreeMap::new();
+        let (left, left_post) = post("t", 1, "20240629120000", "dave", "left root");
+        let (right, right_post) = post("t", 2, "20240629120100", "eve", "right root");
+        let (bridge, bridge_post) = post(
+            "t",
+            3,
+            "20240629120200",
+            "bob",
+            "12:00:00 12:01:00 joins both",
+        );
+        posts.insert(left.clone(), left_post);
+        posts.insert(right.clone(), right_post);
+        posts.insert(bridge.clone(), bridge_post);
+        let analysis = analyze(
+            &posts,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            chrono::NaiveDate::from_ymd_opt(2024, 6, 29)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap(),
+        );
+        let expected = vec![left.clone(), right.clone(), bridge.clone()];
+        assert_eq!(analysis.conversation(&left), expected);
+        assert_eq!(analysis.conversation(&right), expected);
+        assert_eq!(analysis.conversation(&bridge), expected);
+    }
+
+    #[test]
+    fn isolated_posts_are_their_own_conversation() {
+        let mut posts = BTreeMap::new();
+        let (a, pa) = post("t", 1, "20240629120000", "dave", "hello");
+        let (b, pb) = post("t", 2, "20240629120100", "bob", "unrelated");
         posts.insert(a.clone(), pa);
         posts.insert(b.clone(), pb);
         let analysis = analyze(
@@ -543,10 +680,10 @@ mod tests {
                 .and_hms_opt(12, 0, 0)
                 .unwrap(),
         );
-        assert!(analysis.posts[&b].parents.contains(&a));
-        assert!(analysis.posts[&a].children.contains(&b));
-        assert_eq!(analysis.posts[&a].root, Some(a.clone()));
-        assert_eq!(analysis.posts[&b].root, Some(a));
+        assert_eq!(analysis.conversation_root(&a), a);
+        assert_eq!(analysis.conversation_root(&b), b);
+        assert_eq!(analysis.conversation(&a), vec![a]);
+        assert_eq!(analysis.conversation(&b), vec![b]);
     }
 
     #[test]
