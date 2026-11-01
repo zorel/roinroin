@@ -57,8 +57,12 @@ et reprend les fonctions des clients existants `gb3tui`, `gb3-android` et
 - BML : `<b>`, `<i>`, `<u>`, `<s>`, `<tt>`, `<code>`, spoilers cliquables,
   liens bruts, liens `<a>`, entités HTML, bigornos `nick<` ;
 - totoz affichés par leur nom en vert ; au survol, l’image ou l’animation
-  apparaît à sa taille d’origine juste au-dessus du curseur, sans cadre, et
+  apparaît à sa taille d’origine 5 pixels au-dessus du nom, sans cadre, et
   reste immobile tant que le pointeur demeure sur le totoz ;
+- liens : le titre des pages HTML et un aperçu des images sont récupérés à
+  l’arrivée des posts ; au survol du lien, ils apparaissent 5 pixels au-dessus
+  du texte du lien, une petite croix rouge signalant un contenu inaccessible
+  ou protégé ;
 - horloge des posts au format `HH:MM:SS`, colonne fixe ;
 - détection des canards `\_o<` / `>o_/` ;
 - listes **plop** : les messages des auteurs choisis sont remplacés par
@@ -78,7 +82,15 @@ et reprend les fonctions des clients existants `gb3tui`, `gb3-android` et
   l'envoi échoue ;
 - insertion des totoz et emojis dans le brouillon ; choisir un totoz dans la
   recherche revient à la tribune, l'insère avec un espace et place le curseur
-  juste après.
+  juste après ;
+- autocomplétion des totoz directement dans l'éditeur : dès `[:` suivi de deux
+  caractères, les totoz correspondants s'affichent juste au-dessus du champ
+  avec un aperçu miniature (aucune liste s'il n'y a pas de correspondance) ;
+  `↑`/`↓` pour changer de suggestion, `Entrée` ou `Tab` pour l'insérer,
+  `Échap` pour fermer la liste ; le curseur reste dans le champ ;
+- le focus et le curseur sont placés dans l'éditeur au démarrage, à la
+  sélection d'une tribune et au retour sur celle-ci, ainsi que dans le champ
+  de recherche à l'ouverture des écrans ToToz et Emoji.
 
 ### Intégration Linux
 

@@ -1,6 +1,6 @@
 //! Application state, update loop and subscriptions.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Timelike, Utc};
@@ -15,7 +15,7 @@ use crate::config::{
     PersistedState, ServerConfig, ThemeMode,
 };
 use crate::conversation::{self, Analysis};
-use crate::message::{self, ParsedMessage};
+use crate::message::{self, ParsedMessage, Token};
 use crate::model::{quote_clock, Post, PostKey, SourceId, TribuneKey};
 use crate::net;
 use crate::notify;
@@ -74,6 +74,52 @@ pub struct TotozState {
     pub error: Option<String>,
 }
 
+/// Inline totoz autocompletion shown in the composer.
+///
+/// The composer token starts with `[:`; once at least
+/// [`TOTOZ_SUGGEST_MIN_CHARS`] characters follow it, matching totoz names are
+/// listed right above the entry field. An empty `results` list means nothing
+/// is displayed, so an unknown prefix never leaves an empty dropdown behind.
+#[derive(Debug, Clone, Default)]
+pub struct TotozSuggest {
+    pub query: String,
+    pub results: Vec<net::Totoz>,
+    pub selected: Option<usize>,
+    /// Incremented on every query change to discard stale network responses.
+    pub generation: u64,
+    /// Previews already requested for suggestions: avoids fetching the same
+    /// image again while it is loading or after the server returned none.
+    requested_images: HashSet<String>,
+}
+
+impl TotozSuggest {
+    pub fn visible(&self) -> bool {
+        !self.results.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.query.clear();
+        self.results.clear();
+        self.selected = None;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Close the list without forgetting the typed term, so merely hitting
+    /// Escape does not immediately reopen it on the next keystroke.
+    fn dismiss(&mut self) {
+        self.results.clear();
+        self.selected = None;
+        self.generation = self.generation.wrapping_add(1);
+    }
+}
+
+/// Characters needed after `[:` before autocompletion starts.
+const TOTOZ_SUGGEST_MIN_CHARS: usize = 2;
+/// Keep the list short enough to scan at a glance (Baymard: at most ten).
+const TOTOZ_SUGGEST_LIMIT: usize = 8;
+/// Short pause so typing does not hit the totoz server on every keystroke.
+const TOTOZ_SUGGEST_DELAY: Duration = Duration::from_millis(150);
+
 #[derive(Debug, Clone)]
 pub struct TotozImage {
     pub frames: Vec<image::Handle>,
@@ -103,6 +149,27 @@ pub struct HoveredTotoz {
     pub frame_started: Instant,
     pub loading: bool,
     pub error: Option<String>,
+}
+
+const LINK_PREVIEW_CACHE_LIMIT: usize = 20;
+
+/// Metadata cached for a link found in a post.
+#[derive(Debug, Clone)]
+pub enum LinkPreview {
+    Loading,
+    Title(String),
+    Image {
+        handle: image::Handle,
+        width: u32,
+        height: u32,
+    },
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct HoveredLinkPreview {
+    pub url: String,
+    pub anchor: Point,
 }
 
 #[derive(Debug, Clone)]
@@ -239,8 +306,14 @@ pub enum Message {
     MarkAllRead,
     Scrolled(f32),
     Composer(String),
+    ComposerSubmit,
     Insert(String),
     TotozPicked(String),
+    TotozSuggestSearch(u64),
+    TotozSuggestLoaded(u64, Result<Vec<net::Totoz>, String>),
+    TotozSuggestImage(String, Result<Vec<u8>, String>),
+    TotozSuggestPick(String),
+    TotozSuggestDismiss,
     Send,
     FlushSse,
     CursorMoved(Point),
@@ -273,6 +346,7 @@ pub enum Message {
     PostShown(PostKey),
     PostHidden(PostKey),
     TotozHoverImage(String, Result<Vec<u8>, String>),
+    LinkFetched(String, Result<net::LinkMetadata, String>),
     TotozFrameTick,
     LinuxfrRefreshed(Result<LinuxfrSession, String>),
     RefreshLinuxfr,
@@ -296,6 +370,10 @@ pub struct App {
     pub(crate) hovered_link_post: Option<PostKey>,
     pub(crate) hovered_info: Option<String>,
     pub(crate) hovered_totoz: Option<HoveredTotoz>,
+    pub(crate) hovered_link_preview: Option<HoveredLinkPreview>,
+    pub(crate) link_previews: HashMap<String, LinkPreview>,
+    pub(crate) link_image_order: VecDeque<String>,
+    pub(crate) link_title_order: VecDeque<String>,
     pub(crate) hovered_preview: Option<PostKey>,
     pub(crate) preview_hovered: bool,
     pub(crate) preview_epoch: u64,
@@ -305,6 +383,7 @@ pub struct App {
     pub(crate) sidebar_dragging: bool,
     pub(crate) scroll_offset: f32,
     pub(crate) composer: String,
+    pub(crate) totoz_suggest: TotozSuggest,
     pub(crate) draft_dirty: bool,
     pub(crate) state_dirty: bool,
     pub(crate) settings: SettingsDraft,
@@ -324,6 +403,8 @@ pub struct App {
     pub(crate) scroll_to_bottom: bool,
     pub(crate) posts_scroll_id: Id,
     pub(crate) composer_id: Id,
+    pub(crate) totoz_search_id: Id,
+    pub(crate) emoji_search_id: Id,
     pub(crate) linuxfr_refreshing: bool,
     pub(crate) sse_epoch: u64,
     pub(crate) linuxfr_retry_at: Option<Instant>,
@@ -352,6 +433,7 @@ impl App {
         let now = Utc::now().with_timezone(&Paris);
         let mut app = Self {
             composer: config.draft.clone(),
+            totoz_suggest: TotozSuggest::default(),
             settings: SettingsDraft::from_config(&config),
             config,
             persisted,
@@ -367,6 +449,10 @@ impl App {
             hovered_link_post: None,
             hovered_info: None,
             hovered_totoz: None,
+            hovered_link_preview: None,
+            link_previews: HashMap::new(),
+            link_image_order: VecDeque::new(),
+            link_title_order: VecDeque::new(),
             hovered_preview: None,
             preview_hovered: false,
             preview_epoch: 0,
@@ -393,6 +479,8 @@ impl App {
             scroll_to_bottom: true,
             posts_scroll_id: Id::new("roinroin-posts"),
             composer_id: Id::new("roinroin-composer"),
+            totoz_search_id: Id::new("roinroin-totoz-search"),
+            emoji_search_id: Id::new("roinroin-emoji-search"),
             linuxfr_refreshing: false,
             sse_epoch: 0,
             linuxfr_retry_at: None,
@@ -415,6 +503,10 @@ impl App {
             app.active = app.tribunes().first().cloned();
         }
         let mut tasks = app.refresh_tasks();
+        if app.active.is_some() {
+            // Start with the caret in the entry zone, ready to type.
+            tasks.push(focus_text_input(&app.composer_id));
+        }
         let width = app.persisted.window_width;
         let height = app.persisted.window_height;
         if width >= 640.0 && height >= 420.0 {
@@ -463,6 +555,19 @@ impl App {
                     iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                         Some(Message::SidebarDragEnd)
                     }
+                    _ => None,
+                },
+            ));
+        }
+        // The text input consumes Escape to blur itself, so watch the raw
+        // events to close the totoz suggestions without leaving the field.
+        if self.screen == Screen::Main && !self.totoz_suggest.query.is_empty() {
+            subscriptions.push(iced::event::listen_with(
+                |event, _status, _window| match event {
+                    iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                        ..
+                    }) => Some(Message::TotozSuggestDismiss),
                     _ => None,
                 },
             ));
@@ -654,6 +759,11 @@ impl App {
                         self.error = None;
                         if self.active.is_none() {
                             self.active = self.tribunes().first().cloned();
+                            if self.active.is_some() && self.screen == Screen::Main {
+                                // The entry zone just appeared: put the caret
+                                // in it as on startup.
+                                tasks.push(focus_text_input(&self.composer_id));
+                            }
                         }
                     }
                     Err(error) => {
@@ -680,7 +790,11 @@ impl App {
                             state.connected = true;
                             state.last_error = None;
                             self.error = None;
-                            self.ingest(SourceId::Direct(name.clone()), posts, Some(&name));
+                            tasks.extend(self.ingest(
+                                SourceId::Direct(name.clone()),
+                                posts,
+                                Some(&name),
+                            ));
                             if self.selected.is_none()
                                 && self.active.as_ref().is_some_and(|active| {
                                     active.source.kind() == "direct" && active.name == name
@@ -700,7 +814,7 @@ impl App {
                         }
                     }
                 } else if let Ok(posts) = result {
-                    self.ingest(SourceId::Direct(name.clone()), posts, Some(&name));
+                    tasks.extend(self.ingest(SourceId::Direct(name.clone()), posts, Some(&name)));
                 }
             }
             Message::Sse(server, event) => match event {
@@ -764,7 +878,7 @@ impl App {
                         ) {
                             active_received = true;
                         }
-                        self.ingest(SourceId::Gb2c(server), posts, Some(&label));
+                        tasks.extend(self.ingest(SourceId::Gb2c(server), posts, Some(&label)));
                     }
                     if active_received && self.selected.is_none() {
                         tasks.push(iced::widget::operation::snap_to_end(
@@ -784,15 +898,18 @@ impl App {
                             if rewritten != draft {
                                 self.composer = rewritten;
                                 self.draft_dirty = true;
+                                tasks.extend(self.refresh_totoz_suggest());
                             }
                         }
                     }
                     self.active = Some(key);
+                    tasks.push(focus_text_input(&self.composer_id));
                     self.selected = None;
                     self.hovered_post = None;
                     self.hovered_link_post = None;
                     self.hovered_info = None;
                     self.hovered_totoz = None;
+                    self.hovered_link_preview = None;
                     self.hovered_preview = None;
                     self.visible_posts.clear();
                     self.scroll_to_bottom = true;
@@ -804,14 +921,13 @@ impl App {
                 }
             }
             Message::PostClicked(key) => {
+                // Only the clock area is a click target (it quotes the post).
+                // Clicking the rest of the card must not select/highlight it.
                 if self.hovered_post.as_ref() == Some(&key) {
                     if let Some(post) = self.posts.get(&key) {
                         let quote = format!("{} ", quote_clock(post));
                         tasks.push(self.insert_composer(&quote));
                     }
-                } else {
-                    self.selected = Some(key);
-                    self.scroll_to_bottom = false;
                 }
             }
             Message::ClearSelection => {
@@ -876,6 +992,14 @@ impl App {
             Message::Composer(value) => {
                 self.composer = value;
                 self.draft_dirty = true;
+                tasks.extend(self.refresh_totoz_suggest());
+            }
+            Message::ComposerSubmit => {
+                if self.totoz_suggest.visible() {
+                    tasks.extend(self.pick_totoz_suggestion());
+                } else {
+                    tasks.extend(self.send_message());
+                }
             }
             Message::Insert(text) => {
                 tasks.push(self.insert_composer(&text));
@@ -883,12 +1007,64 @@ impl App {
             Message::TotozPicked(name) => {
                 self.screen = Screen::Main;
                 self.hovered_totoz = None;
+                self.hovered_link_preview = None;
                 self.hovered_preview = None;
                 self.scroll_to_bottom = true;
                 tasks.push(self.insert_composer(&format!("[:{name}] ")));
                 tasks.push(iced::widget::operation::snap_to_end(
                     self.posts_scroll_id.clone(),
                 ));
+            }
+            Message::TotozSuggestSearch(generation) => {
+                if generation != self.totoz_suggest.generation {
+                    return Task::batch(tasks);
+                }
+                let terms = self.totoz_suggest.query.clone();
+                let still_typed = totoz_suggestion_term(&self.composer) == Some(terms.as_str());
+                if terms.is_empty() || !still_typed {
+                    return Task::batch(tasks);
+                }
+                let client = self.client.clone();
+                let server = self.config.totoz_server.clone();
+                let gb2c = self
+                    .config
+                    .servers
+                    .iter()
+                    .find(|server| server.enabled)
+                    .map(|server| server.url.clone());
+                tasks.push(Task::perform(
+                    async move {
+                        search_totoz_any(&client, &server, gb2c.as_deref(), &terms).await
+                    },
+                    move |result| Message::TotozSuggestLoaded(generation, result),
+                ));
+            }
+            Message::TotozSuggestLoaded(generation, result) => {
+                if generation == self.totoz_suggest.generation {
+                    tasks.extend(self.apply_totoz_suggestions(result));
+                }
+            }
+            Message::TotozSuggestImage(name, result) => {
+                if let Ok(bytes) = result {
+                    if let Some(image) = decode_totoz_image(&bytes) {
+                        self.totoz.images.insert(name, image);
+                    }
+                }
+            }
+            Message::TotozSuggestPick(name) => {
+                tasks.extend(self.pick_totoz_suggestion_named(&name));
+            }
+            Message::TotozSuggestDismiss => {
+                if self.totoz_suggest.visible() {
+                    self.totoz_suggest.dismiss();
+                    // The text input also handles Escape by unfocusing itself;
+                    // keep the caret in the entry zone so typing can resume.
+                    tasks.push(iced::widget::operation::focus(self.composer_id.clone()));
+                } else if !self.totoz_suggest.query.is_empty() {
+                    // Cancel a pending debounced search without stealing the
+                    // Escape key from the text input.
+                    self.totoz_suggest.dismiss();
+                }
             }
             Message::Send => {
                 tasks.extend(self.send_message());
@@ -931,6 +1107,9 @@ impl App {
                     self.totoz.loading = true;
                     self.totoz.error = None;
                     self.totoz.images.clear();
+                    // Let the inline autocompletion fetch its thumbnails again
+                    // instead of pointing at names removed with the cache.
+                    self.totoz_suggest.requested_images.clear();
                     let client = self.client.clone();
                     let server = self.config.totoz_server.clone();
                     let gb2c = self
@@ -941,23 +1120,7 @@ impl App {
                         .map(|server| server.url.clone());
                     tasks.push(Task::perform(
                         async move {
-                            match net::search_totoz(&client, &server, &terms).await {
-                                Ok(results) if !results.is_empty() => Ok(results),
-                                Ok(_) => match gb2c {
-                                    Some(base) => {
-                                        net::search_totoz_gb2c(&client, &base, &terms).await
-                                    }
-                                    None => Ok(Vec::new()),
-                                },
-                                Err(error) => match gb2c {
-                                    Some(base) => net::search_totoz_gb2c(&client, &base, &terms)
-                                        .await
-                                        .map_err(|fallback| {
-                                            format!("{error} ; relais gb2c : {fallback}")
-                                        }),
-                                    None => Err(error),
-                                },
-                            }
+                            search_totoz_any(&client, &server, gb2c.as_deref(), &terms).await
                         },
                         Message::TotozLoaded,
                     ));
@@ -1074,17 +1237,22 @@ impl App {
                 tasks.extend(self.update_settings(settings));
             }
             Message::OpenSettings => {
+                self.totoz_suggest.clear();
                 self.settings = SettingsDraft::from_config(&self.config);
                 self.screen = Screen::Settings;
             }
             Message::OpenTotoz => {
+                self.totoz_suggest.clear();
                 self.screen = Screen::Totoz;
+                tasks.push(focus_text_input(&self.totoz_search_id));
                 if self.totoz.results.is_empty() && !self.totoz.query.trim().is_empty() {
                     tasks.push(Task::done(Message::TotozSearch));
                 }
             }
             Message::OpenEmoji => {
+                self.totoz_suggest.clear();
                 self.screen = Screen::Emoji;
+                tasks.push(focus_text_input(&self.emoji_search_id));
                 if self.emoji.results.is_empty() {
                     tasks.push(Task::done(Message::EmojiSearch));
                 }
@@ -1097,8 +1265,10 @@ impl App {
                 self.hovered_link_post = None;
                 self.hovered_info = None;
                 self.hovered_totoz = None;
+                self.hovered_link_preview = None;
                 self.hovered_preview = None;
                 self.scroll_to_bottom = true;
+                tasks.push(focus_text_input(&self.composer_id));
                 tasks.push(iced::widget::operation::snap_to_end(
                     self.posts_scroll_id.clone(),
                 ));
@@ -1131,6 +1301,7 @@ impl App {
                 if key.is_some() {
                     self.hovered_info = None;
                     self.hovered_totoz = None;
+                    self.hovered_link_preview = None;
                 }
                 self.hovered_post = key;
             }
@@ -1139,6 +1310,7 @@ impl App {
                 self.hovered_link_post = None;
                 self.hovered_info = None;
                 self.hovered_totoz = None;
+                self.hovered_link_preview = None;
                 self.schedule_preview_hide(&mut tasks);
             }
             Message::PostShown(key) => {
@@ -1150,10 +1322,22 @@ impl App {
             Message::HoverLink(link, anchor) => {
                 self.hovered_info = None;
                 self.hovered_link_post = None;
+                self.hovered_link_preview = None;
                 if link.is_some() {
                     self.hovered_post = None;
                 }
                 match link {
+                    Some(LinkAction::Url(url)) => {
+                        self.hovered_preview = None;
+                        self.hovered_totoz = None;
+                        // HoverRich reports the text anchor in the scrollable
+                        // content space; convert it to window coordinates so
+                        // the popup stays anchored above the link text.
+                        self.hovered_link_preview = Some(HoveredLinkPreview {
+                            url,
+                            anchor: Point::new(anchor.x, anchor.y - self.scroll_offset),
+                        });
+                    }
                     Some(LinkAction::Jump(key)) => {
                         if !self.visible_posts.contains(&key) {
                             self.hovered_preview = Some(key.clone());
@@ -1256,6 +1440,21 @@ impl App {
                         }
                     }
                 }
+            }
+            Message::LinkFetched(url, result) => {
+                let preview = match result {
+                    Ok(net::LinkMetadata::Title(title)) => LinkPreview::Title(title),
+                    Ok(net::LinkMetadata::Image(bytes)) => match decode_link_image(&bytes) {
+                        Some((handle, width, height)) => LinkPreview::Image {
+                            handle,
+                            width,
+                            height,
+                        },
+                        None => LinkPreview::Error,
+                    },
+                    Err(_) => LinkPreview::Error,
+                };
+                self.cache_link_preview(url, preview);
             }
             Message::RefreshLinuxfr => {
                 if !self.linuxfr_refreshing
@@ -1645,7 +1844,13 @@ impl App {
         self.analysis_dirty = true;
     }
 
-    fn ingest(&mut self, source: SourceId, posts: Vec<Post>, label: Option<&str>) {
+    fn ingest(
+        &mut self,
+        source: SourceId,
+        posts: Vec<Post>,
+        label: Option<&str>,
+    ) -> Vec<Task<Message>> {
+        let mut new_links = BTreeSet::new();
         for mut post in posts {
             if post.id <= 0 || post.tribune.trim().is_empty() {
                 continue;
@@ -1655,10 +1860,26 @@ impl App {
             let is_new = !self.posts.contains_key(&key);
             if is_new {
                 self.pending_notifications.push(key.clone());
+                new_links.extend(post_links(&post.message));
             }
             self.posts.insert(key, post);
         }
         self.analysis_dirty = true;
+
+        let mut tasks = Vec::new();
+        for url in new_links {
+            if self.link_previews.contains_key(&url) {
+                continue;
+            }
+            self.link_previews.insert(url.clone(), LinkPreview::Loading);
+            let client = self.client.clone();
+            let request_url = url.clone();
+            tasks.push(Task::perform(
+                async move { net::fetch_link_metadata(&client, &request_url).await },
+                move |result| Message::LinkFetched(url.clone(), result),
+            ));
+        }
+        tasks
     }
 
     /// Treat the backlog of a newly discovered tribune as read. SSE delivers
@@ -1758,6 +1979,7 @@ impl App {
         self.error = None;
         self.config.draft.clear();
         self.composer.clear();
+        self.totoz_suggest.clear();
         self.config.last_posted = text.clone();
         self.pending_post = Some(text.clone());
         self.save_config_quietly();
@@ -1808,9 +2030,128 @@ impl App {
     fn insert_composer(&mut self, text: &str) -> Task<Message> {
         self.composer.push_str(text);
         self.draft_dirty = true;
-        iced::widget::operation::focus(self.composer_id.clone()).chain(
-            iced::widget::operation::move_cursor_to_end(self.composer_id.clone()),
-        )
+        self.totoz_suggest.clear();
+        focus_text_input(&self.composer_id)
+    }
+
+    /// Detect the unfinished `[:…` token at the end of the composer and start
+    /// a (debounced) totoz search when it changed. Anything shorter than
+    /// [`TOTOZ_SUGGEST_MIN_CHARS`] characters closes the suggestion list.
+    fn refresh_totoz_suggest(&mut self) -> Vec<Task<Message>> {
+        let query = totoz_suggestion_term(&self.composer)
+            .unwrap_or_default()
+            .to_owned();
+        if query == self.totoz_suggest.query {
+            return Vec::new();
+        }
+        self.totoz_suggest.generation = self.totoz_suggest.generation.wrapping_add(1);
+        self.totoz_suggest.query = query.clone();
+        if query.is_empty() {
+            self.totoz_suggest.results.clear();
+            self.totoz_suggest.selected = None;
+            return Vec::new();
+        }
+        // Filter the previous list right away so it keeps matching while the
+        // debounced request runs, instead of blinking out on every keypress.
+        let lower = query.to_lowercase();
+        self.totoz_suggest
+            .results
+            .retain(|totoz| totoz.name.to_lowercase().contains(&lower));
+        self.totoz_suggest.selected = (!self.totoz_suggest.results.is_empty()).then_some(0);
+        let generation = self.totoz_suggest.generation;
+        vec![Task::perform(
+            async move {
+                tokio::time::sleep(TOTOZ_SUGGEST_DELAY).await;
+            },
+            move |_| Message::TotozSuggestSearch(generation),
+        )]
+    }
+
+    fn apply_totoz_suggestions(
+        &mut self,
+        result: Result<Vec<net::Totoz>, String>,
+    ) -> Vec<Task<Message>> {
+        let matches = match result {
+            Ok(results) => {
+                rank_totoz_suggestions(results, &self.totoz_suggest.query, TOTOZ_SUGGEST_LIMIT)
+            }
+            // Unknown prefix or unreachable server: display nothing at all.
+            Err(_) => Vec::new(),
+        };
+        self.totoz_suggest.selected = (!matches.is_empty()).then_some(0);
+        self.totoz_suggest.results = matches;
+        self.fetch_totoz_suggest_images()
+    }
+
+    /// Fetch the small previews shown next to each suggestion. Images are
+    /// cached in [`TotozState::images`] and shared with the totoz picker and
+    /// the hover previews, so each name is only downloaded once.
+    fn fetch_totoz_suggest_images(&mut self) -> Vec<Task<Message>> {
+        let names: Vec<String> = self
+            .totoz_suggest
+            .results
+            .iter()
+            .map(|totoz| totoz.name.clone())
+            .collect();
+        let client = self.client.clone();
+        let server = self.config.totoz_server.clone();
+        let mut tasks = Vec::new();
+        for name in names {
+            if self.totoz.images.contains_key(&name)
+                || self.totoz_suggest.requested_images.contains(&name)
+            {
+                continue;
+            }
+            self.totoz_suggest.requested_images.insert(name.clone());
+            let client = client.clone();
+            let server = server.clone();
+            tasks.push(Task::perform(
+                async move {
+                    let result = net::fetch_totoz_image(&client, &server, &name).await;
+                    (name, result)
+                },
+                |(name, result)| Message::TotozSuggestImage(name, result),
+            ));
+        }
+        tasks
+    }
+
+    /// Move the highlighted suggestion, wrapping around at both ends.
+    fn move_totoz_suggestion(&mut self, delta: isize) {
+        let count = self.totoz_suggest.results.len();
+        if count == 0 {
+            return;
+        }
+        let current = self.totoz_suggest.selected.unwrap_or(0) as isize;
+        let next = (current + delta).rem_euclid(count as isize) as usize;
+        self.totoz_suggest.selected = Some(next);
+    }
+
+    fn pick_totoz_suggestion(&mut self) -> Vec<Task<Message>> {
+        let Some(totoz) = self
+            .totoz_suggest
+            .selected
+            .and_then(|index| self.totoz_suggest.results.get(index))
+        else {
+            return Vec::new();
+        };
+        let name = totoz.name.clone();
+        self.pick_totoz_suggestion_named(&name)
+    }
+
+    /// Replace the in-progress `[:…` token with the complete totoz reference.
+    fn pick_totoz_suggestion_named(&mut self, name: &str) -> Vec<Task<Message>> {
+        let Some(start) = self.composer.rfind("[:") else {
+            return Vec::new();
+        };
+        if totoz_suggestion_term(&self.composer).is_none() {
+            return Vec::new();
+        }
+        self.composer.truncate(start);
+        self.composer.push_str(&format!("[:{name}] "));
+        self.draft_dirty = true;
+        self.totoz_suggest.clear();
+        vec![focus_text_input(&self.composer_id)]
     }
 
     fn handle_link(&mut self, action: LinkAction) -> Vec<Task<Message>> {
@@ -1833,7 +2174,10 @@ impl App {
             LinkAction::Totoz(name) => {
                 self.totoz.query = name;
                 self.screen = Screen::Totoz;
-                vec![Task::done(Message::TotozSearch)]
+                vec![
+                    focus_text_input(&self.totoz_search_id),
+                    Task::done(Message::TotozSearch),
+                ]
             }
             LinkAction::Info(_, key) => {
                 let Some(post) = self.posts.get(&key) else {
@@ -1860,6 +2204,25 @@ impl App {
         let control = modifiers.control();
         let alt = modifiers.alt();
         let shift = modifiers.shift();
+
+        if self.screen == Screen::Main && self.totoz_suggest.visible() {
+            match &key {
+                keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
+                    self.move_totoz_suggestion(1);
+                    return Vec::new();
+                }
+                keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
+                    self.move_totoz_suggestion(-1);
+                    return Vec::new();
+                }
+                // Tab accepts the highlighted totoz; Ctrl+Tab keeps switching
+                // tribunes below. The composer keeps focus either way.
+                keyboard::Key::Named(keyboard::key::Named::Tab) if !control => {
+                    return self.pick_totoz_suggestion();
+                }
+                _ => {}
+            }
+        }
 
         if (control || alt) && key == keyboard::Key::Named(keyboard::key::Named::Enter) {
             return vec![Task::done(Message::Send)];
@@ -2152,10 +2515,36 @@ impl App {
         ));
     }
 
+    /// Keep only the most recent title and image previews. Errors and pending
+    /// fetches are cheap and stay cached so hovering a failed link keeps
+    /// showing its red cross.
+    fn cache_link_preview(&mut self, url: String, preview: LinkPreview) {
+        let is_image = match &preview {
+            LinkPreview::Image { .. } => Some(true),
+            LinkPreview::Title(_) => Some(false),
+            LinkPreview::Loading | LinkPreview::Error => None,
+        };
+        if let Some(is_image) = is_image {
+            let order = if is_image {
+                &mut self.link_image_order
+            } else {
+                &mut self.link_title_order
+            };
+            order.retain(|item| item != &url);
+            order.push_back(url.clone());
+            while order.len() > LINK_PREVIEW_CACHE_LIMIT {
+                if let Some(oldest) = order.pop_front() {
+                    self.link_previews.remove(&oldest);
+                }
+            }
+        }
+        self.link_previews.insert(url, preview);
+    }
+
     fn hover_totoz(&mut self, name: String, anchor: Point) -> Vec<Task<Message>> {
-        // The widget cursor lives in the scrollable content coordinate space;
-        // convert it back to window coordinates so the popup is anchored at
-        // the pointer and stays still while scrolling.
+        // The widget reports the text anchor in the scrollable content
+        // coordinate space; convert it back to window coordinates so the
+        // popup is anchored above the totoz and stays still while scrolling.
         let anchor = Point::new(anchor.x, anchor.y - self.scroll_offset);
         if let Some(image) = self.totoz.images.get(&name).cloned() {
             self.hovered_totoz = Some(HoveredTotoz {
@@ -2249,6 +2638,57 @@ impl App {
     }
 }
 
+fn post_links(message: &str) -> impl Iterator<Item = String> {
+    message::parse(message)
+        .tokens
+        .into_iter()
+        .filter_map(|token| match token {
+            Token::Link { href, .. }
+                if url::Url::parse(&href)
+                    .is_ok_and(|url| matches!(url.scheme(), "http" | "https")) =>
+            {
+                Some(href)
+            }
+            _ => None,
+        })
+}
+
+fn decode_link_image(bytes: &[u8]) -> Option<(image::Handle, u32, u32)> {
+    let reader = ::image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let (width, height) = reader.into_dimensions().ok()?;
+    if width == 0 || height == 0 || width > 8192 || height > 8192 {
+        return None;
+    }
+
+    let decoded = ::image::load_from_memory(bytes).ok()?;
+    let rgba = decoded.to_rgba8();
+    let (width, height) = rgba.dimensions();
+
+    // Keep the preview reasonable on screen and avoid uploading huge GPU
+    // textures; preserve the aspect ratio.
+    let scale = (480.0 / width as f32).min(360.0 / height as f32).min(1.0);
+    let (width, height, buffer) = if scale < 1.0 {
+        let scaled_width = ((width as f32 * scale).round() as u32).max(1);
+        let scaled_height = ((height as f32 * scale).round() as u32).max(1);
+        let scaled = ::image::imageops::resize(
+            &rgba,
+            scaled_width,
+            scaled_height,
+            ::image::imageops::FilterType::Triangle,
+        );
+        (scaled_width, scaled_height, scaled)
+    } else {
+        (width, height, rgba)
+    };
+    Some((
+        image::Handle::from_rgba(width, height, buffer.into_raw()),
+        width,
+        height,
+    ))
+}
+
 fn decode_totoz_image(bytes: &[u8]) -> Option<TotozImage> {
     let reader = ::image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
@@ -2310,6 +2750,76 @@ fn build_sse(config: &net::SseConfig) -> impl futures::Stream<Item = Message> {
     net::sse_stream(config.clone()).map(move |event| Message::Sse(server.clone(), event))
 }
 
+/// Focus a text input and place the caret at the end so typing can resume.
+fn focus_text_input(id: &Id) -> Task<Message> {
+    iced::widget::operation::focus(id.clone())
+        .chain(iced::widget::operation::move_cursor_to_end(id.clone()))
+}
+
+/// Keep only names containing `query`, with prefix matches first, then the
+/// rest in alphabetical order. The result never exceeds `limit`.
+fn rank_totoz_suggestions(results: Vec<net::Totoz>, query: &str, limit: usize) -> Vec<net::Totoz> {
+    let query = query.to_lowercase();
+    let mut matches: Vec<net::Totoz> = results
+        .into_iter()
+        .filter(|totoz| totoz.name.to_lowercase().contains(&query))
+        .collect();
+    matches.sort_by(|left, right| {
+        let left_name = left.name.to_lowercase();
+        let right_name = right.name.to_lowercase();
+        let left_prefix = !left_name.starts_with(&query);
+        let right_prefix = !right_name.starts_with(&query);
+        left_prefix
+            .cmp(&right_prefix)
+            .then_with(|| left_name.cmp(&right_name))
+    });
+    matches.dedup_by(|left, right| left.name.eq_ignore_ascii_case(&right.name));
+    matches.truncate(limit);
+    matches
+}
+
+/// Return the unfinished `[:…` totoz term typed at the very end of `text`.
+///
+/// A term only counts once it holds [`TOTOZ_SUGGEST_MIN_CHARS`] characters:
+/// after `[:` and two characters the autocompletion can start. Closed tokens
+/// (`[:duck]`) and line breaks end the term.
+fn totoz_suggestion_term(text: &str) -> Option<&str> {
+    let start = text.rfind("[:")?;
+    let term = text[start + 2..].trim();
+    if term.contains(']')
+        || term.contains('\n')
+        || term.contains('\r')
+        || term.chars().count() < TOTOZ_SUGGEST_MIN_CHARS
+    {
+        return None;
+    }
+    Some(term)
+}
+
+/// Search the configured totoz server, falling back to a gb2c relay when the
+/// server has no direct match. Shared by the totoz screen and the inline
+/// autocompletion.
+async fn search_totoz_any(
+    client: &reqwest::Client,
+    server: &str,
+    gb2c: Option<&str>,
+    terms: &str,
+) -> Result<Vec<net::Totoz>, String> {
+    match net::search_totoz(client, server, terms).await {
+        Ok(results) if !results.is_empty() => Ok(results),
+        Ok(_) => match gb2c {
+            Some(base) => net::search_totoz_gb2c(client, base, terms).await,
+            None => Ok(Vec::new()),
+        },
+        Err(error) => match gb2c {
+            Some(base) => net::search_totoz_gb2c(client, base, terms)
+                .await
+                .map_err(|fallback| format!("{error} ; relais gb2c : {fallback}")),
+            None => Err(error),
+        },
+    }
+}
+
 fn keyboard_shortcut(event: keyboard::Event) -> Option<Message> {
     match event {
         keyboard::Event::KeyPressed { .. } => Some(Message::Keyboard(event)),
@@ -2341,6 +2851,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn extracts_http_links_from_posts() {
+        let links = post_links(
+            "see https://example.com/a and <a href=\"http://example.org/x\">label</a> \
+             plus ftp://example.net/file",
+        )
+        .collect::<Vec<_>>();
+        assert_eq!(
+            links,
+            vec![
+                "https://example.com/a".to_owned(),
+                "http://example.org/x".to_owned()
+            ]
+        );
+    }
+
+    #[test]
     fn bigornos_notify_even_when_focused() {
         let notifications = NotifyConfig::default();
         assert!(notifications.only_unfocused);
@@ -2356,5 +2882,60 @@ mod tests {
             ..NotifyConfig::default()
         };
         assert!(!notification_allowed(&notifications, false, true, true));
+    }
+
+    #[test]
+    fn totoz_autocomplete_starts_after_two_chars() {
+        assert_eq!(totoz_suggestion_term("hello [:du"), Some("du"));
+        assert_eq!(totoz_suggestion_term("[:du"), Some("du"));
+        assert_eq!(totoz_suggestion_term("[:d"), None);
+        assert_eq!(totoz_suggestion_term("[:  d"), None);
+        assert_eq!(totoz_suggestion_term("[:éé"), Some("éé"));
+    }
+
+    #[test]
+    fn totoz_autocomplete_ignores_closed_tokens() {
+        assert_eq!(totoz_suggestion_term("hello"), None);
+        assert_eq!(totoz_suggestion_term("[:duck] hello"), None);
+        assert_eq!(totoz_suggestion_term("[:du\nmore"), None);
+        assert_eq!(totoz_suggestion_term("word [:du "), Some("du"));
+        assert_eq!(totoz_suggestion_term("word [:du] then [:mo"), Some("mo"));
+    }
+
+    fn totoz(name: &str) -> net::Totoz {
+        net::Totoz {
+            name: name.to_owned(),
+            image: String::new(),
+        }
+    }
+
+    #[test]
+    fn totoz_suggestions_prefer_prefix_matches() {
+        let ranked = rank_totoz_suggestions(
+            vec![
+                totoz("goodduck"),
+                totoz("duckling"),
+                totoz("Duck"),
+                totoz("cat"),
+            ],
+            "du",
+            8,
+        );
+        let names: Vec<_> = ranked.iter().map(|totoz| totoz.name.as_str()).collect();
+        assert_eq!(names, vec!["Duck", "duckling", "goodduck"]);
+    }
+
+    #[test]
+    fn totoz_suggestions_are_empty_without_a_match() {
+        let ranked = rank_totoz_suggestions(vec![totoz("duck")], "zz", 8);
+        assert!(ranked.is_empty());
+    }
+
+    #[test]
+    fn totoz_suggestions_are_capped() {
+        let results = (0..12)
+            .map(|index| totoz(&format!("duck{index}")))
+            .collect();
+        assert_eq!(rank_totoz_suggestions(results, "duck", 8).len(), 8);
     }
 }

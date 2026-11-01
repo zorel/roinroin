@@ -304,6 +304,45 @@ pub fn tribune_button(theme: &Theme, status: button::Status, active: bool) -> bu
     }
 }
 
+/// Panel holding the inline totoz autocompletion above the composer.
+pub fn totoz_suggestion_panel(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(card_color(theme))),
+        text_color: Some(text_color(theme)),
+        border: Border {
+            color: Color { a: 0.30, ..ACCENT },
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        shadow: Shadow {
+            color: Color {
+                a: 0.35,
+                ..Color::BLACK
+            },
+            offset: iced::Vector::new(0.0, -2.0),
+            blur_radius: 8.0,
+        },
+        snap: true,
+    }
+}
+
+/// One row of the totoz autocompletion. The active row (keyboard or hover) is
+/// shaded so users always know which suggestion Enter will pick.
+pub fn totoz_suggestion(theme: &Theme, status: button::Status, active: bool) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: (active || hovered).then_some(Background::Color(Color { a: 0.18, ..ACCENT })),
+        text_color: text_color(theme),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 6.0.into(),
+        },
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
 pub fn text_input_style(
     theme: &Theme,
     status: iced::widget::text_input::Status,

@@ -4,12 +4,14 @@
 //! iced `Task` or `Subscription`; no blocking call is made on the GUI thread.
 
 use std::collections::BTreeSet;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use bytes::BytesMut;
 use futures::{SinkExt, Stream, StreamExt};
 use quick_xml::events::Event as XmlEvent;
 use quick_xml::Reader;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Board, LinuxfrSession};
@@ -34,6 +36,14 @@ pub struct Totoz {
 pub struct Emoji {
     pub name: String,
     pub characters: String,
+}
+
+/// Metadata fetched for a URL found in a post: the page title for HTML, the
+/// raw bytes for an image.
+#[derive(Debug, Clone)]
+pub enum LinkMetadata {
+    Title(String),
+    Image(Vec<u8>),
 }
 
 pub fn client() -> reqwest::Client {
@@ -364,6 +374,93 @@ pub async fn fetch_totoz_image(
     read_bounded(response, 2 * 1024 * 1024).await
 }
 
+const MAX_LINK_HTML_BYTES: usize = 512 * 1024;
+const MAX_LINK_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_LINK_TITLE_CHARS: usize = 200;
+
+pub async fn fetch_link_metadata(
+    client: &reqwest::Client,
+    href: &str,
+) -> Result<LinkMetadata, String> {
+    let url = url::Url::parse(href).map_err(|error| format!("lien : {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("lien non pris en charge".into());
+    }
+    let response = client
+        .get(url)
+        .timeout(Duration::from_secs(15))
+        .header(
+            reqwest::header::ACCEPT,
+            "text/html,application/xhtml+xml,image/*;q=0.9,*/*;q=0.5",
+        )
+        .send()
+        .await
+        .map_err(|error| format!("lien : {error}"))?;
+
+    let status = response.status();
+    if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        return Err("authentification requise".into());
+    }
+    if !status.is_success() {
+        return Err(format!("lien : HTTP {status}"));
+    }
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if content_type.contains("text/html") || content_type.contains("application/xhtml+xml") {
+        // The title lives in <head>, so a truncated body is enough and avoids
+        // failing on pages larger than the cap.
+        let bytes = read_prefix(response, MAX_LINK_HTML_BYTES).await?;
+        let html = String::from_utf8_lossy(&bytes);
+        let title = html_title(&html).ok_or_else(|| "titre introuvable".to_owned())?;
+        return Ok(LinkMetadata::Title(title));
+    }
+
+    if content_type.starts_with("image/") {
+        let bytes = read_bounded(response, MAX_LINK_IMAGE_BYTES).await?;
+        return Ok(LinkMetadata::Image(bytes));
+    }
+
+    // Servers often omit or mislabel the content type. Sniff the body so an
+    // image is still recognized, then fall back to an HTML title.
+    let bytes = read_bounded(response, MAX_LINK_IMAGE_BYTES).await?;
+    if ::image::guess_format(&bytes).is_ok() {
+        return Ok(LinkMetadata::Image(bytes));
+    }
+    if let Some(title) = html_title(&String::from_utf8_lossy(&bytes)) {
+        return Ok(LinkMetadata::Title(title));
+    }
+    Err("contenu non pris en charge".into())
+}
+
+fn html_title(html: &str) -> Option<String> {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    let regex = REGEX.get_or_init(|| {
+        Regex::new(r"(?is)<title[^>]*>(.*?)</title\s*>").expect("valid title regex")
+    });
+    let raw = regex.captures(html)?.get(1)?.as_str();
+    let decoded = crate::message::decode_entities(raw);
+    let title = decoded.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.is_empty() {
+        return None;
+    }
+    let mut characters = title.chars();
+    let shortened: String = characters.by_ref().take(MAX_LINK_TITLE_CHARS).collect();
+    Some(if characters.next().is_some() {
+        format!("{shortened}…")
+    } else {
+        shortened
+    })
+}
+
 pub async fn search_emoji(
     client: &reqwest::Client,
     base_url: &str,
@@ -431,6 +528,21 @@ pub async fn refresh_linuxfr(
         expires_at: chrono::Utc::now().timestamp() + data.expires_in.max(60),
         login: String::new(),
     })
+}
+
+async fn read_prefix(response: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let mut stream = response.bytes_stream();
+    let mut output = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        let remaining = max_bytes.saturating_sub(output.len());
+        if chunk.len() >= remaining {
+            output.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        output.extend_from_slice(&chunk);
+    }
+    Ok(output)
 }
 
 async fn read_bounded(response: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>, String> {
@@ -778,6 +890,19 @@ pub fn builtin_emoji() -> Vec<Emoji> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_html_titles() {
+        assert_eq!(
+            html_title("<html><head><title> Hello &amp; world </title></head></html>").as_deref(),
+            Some("Hello & world")
+        );
+        assert_eq!(
+            html_title("<TITLE>\n  spaced\n title \n</TITLE>").as_deref(),
+            Some("spaced title")
+        );
+        assert_eq!(html_title("<title>   </title>"), None);
+    }
 
     #[test]
     fn parses_poll_payload() {

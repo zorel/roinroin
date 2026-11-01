@@ -270,11 +270,16 @@ impl Widget<Message, Theme, Renderer> for HoverRich<'_> {
                     .hovered_link
                     .and_then(|index| self.spans.get(index))
                     .and_then(|span| span.link.clone());
-                // Report the pointer position so hover popups (totoz images)
-                // can be anchored right above the cursor. This is only
-                // published when the hovered link changes, so the popup stays
-                // still while the pointer moves inside the same link.
-                let anchor = cursor.position().unwrap_or_else(|| layout.position());
+                // Report the top-center of the hovered span so hover popups
+                // are anchored above the link/totoz text instead of the
+                // pointer. This is only published when the hovered link
+                // changes, so the popup stays still while the pointer moves
+                // inside the same link.
+                let anchor = state
+                    .hovered_link
+                    .and_then(|index| span_anchor(&state.paragraph, layout, index))
+                    .or_else(|| cursor.position())
+                    .unwrap_or_else(|| layout.position());
                 shell.publish(on_link_hover(link, anchor));
             }
             shell.request_redraw();
@@ -321,6 +326,22 @@ impl Widget<Message, Theme, Renderer> for HoverRich<'_> {
             mouse::Interaction::None
         }
     }
+}
+
+/// Top-center of a span in content coordinates, used to anchor hover popups
+/// above the link/totoz text.
+fn span_anchor(paragraph: &ParagraphType, layout: Layout<'_>, index: usize) -> Option<Point> {
+    let regions = paragraph.span_bounds(index);
+    let first = regions.first()?;
+    let mut left = first.x;
+    let mut right = first.x + first.width;
+    let mut top = first.y;
+    for region in &regions[1..] {
+        left = left.min(region.x);
+        right = right.max(region.x + region.width);
+        top = top.min(region.y);
+    }
+    Some(layout.position() + Vector::new((left + right) / 2.0, top))
 }
 
 #[allow(clippy::too_many_arguments)]

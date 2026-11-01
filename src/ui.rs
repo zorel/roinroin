@@ -9,7 +9,9 @@ use iced::widget::{
 };
 use iced::{mouse, Alignment, Color, Element, Fill, Font, Length, Vector};
 
-use crate::app::{App, ConnectionStatus, LinkAction, Message, Screen, SettingsMessage};
+use crate::app::{
+    App, ConnectionStatus, LinkAction, LinkPreview, Message, Screen, SettingsMessage,
+};
 use crate::config::{BlockedMode, BoardAuth, ThemeMode};
 use crate::hover_text::HoverRich;
 use crate::message::Token;
@@ -41,7 +43,12 @@ pub fn view(app: &App) -> Element<'_, Message> {
     } else {
         Space::new().width(Fill).height(Fill).into()
     };
-    iced::widget::stack![base, preview, totoz].into()
+    let link = if app.screen == Screen::Main {
+        link_preview_overlay(app)
+    } else {
+        Space::new().width(Fill).height(Fill).into()
+    };
+    iced::widget::stack![base, preview, totoz, link].into()
 }
 
 fn post_preview_overlay(app: &App) -> Element<'_, Message> {
@@ -92,21 +99,78 @@ fn totoz_hover_overlay(app: &App) -> Element<'_, Message> {
     };
     let width = preview.width as f32;
     let height = preview.height as f32;
+    let anchor = totoz.anchor;
     let window_width = app.window_size.width.max(1.0);
     let window_height = app.window_size.height.max(1.0);
-    let left = (totoz.anchor.x - width / 2.0).clamp(4.0, (window_width - width - 4.0).max(4.0));
-    let mut top = totoz.anchor.y - height - 6.0;
-    if top < 70.0 {
-        top = totoz.anchor.y + 18.0;
-    }
-    let top = top.clamp(4.0, (window_height - height - 4.0).max(4.0));
 
     let frame = preview
         .frames
         .get(totoz.frame_index)
         .unwrap_or_else(|| preview.first_frame());
     iced::widget::float(image(frame.clone()).width(width).height(height))
-        .translate(move |bounds, _viewport| Vector::new(left - bounds.x, top - bounds.y))
+        .translate(move |bounds, _viewport| {
+            let left = (anchor.x - bounds.width / 2.0)
+                .clamp(4.0, (window_width - bounds.width - 4.0).max(4.0));
+            let above = anchor.y - bounds.height - 5.0;
+            let top = if above >= 4.0 {
+                above
+            } else {
+                (anchor.y + 18.0).min((window_height - bounds.height - 4.0).max(4.0))
+            };
+            Vector::new(left - bounds.x, top - bounds.y)
+        })
+        .into()
+}
+
+fn link_preview_overlay(app: &App) -> Element<'_, Message> {
+    let Some(hovered) = &app.hovered_link_preview else {
+        return Space::new().width(Fill).height(Fill).into();
+    };
+    let Some(preview) = app.link_previews.get(&hovered.url) else {
+        return Space::new().width(Fill).height(Fill).into();
+    };
+
+    let content: Element<'_, Message> = match preview {
+        LinkPreview::Loading => {
+            return Space::new().width(Fill).height(Fill).into();
+        }
+        LinkPreview::Error => {
+            container(text("✗").size(16).color(Color::from_rgb8(0xff, 0x55, 0x55)))
+                .padding([1, 4])
+                .style(colors::panel)
+                .into()
+        }
+        LinkPreview::Title(title) => container(text(title.as_str()).size(13))
+            .padding(6)
+            .max_width(420)
+            .style(colors::panel)
+            .into(),
+        LinkPreview::Image {
+            handle,
+            width,
+            height,
+        } => image(handle.clone())
+            .width(*width as f32)
+            .height(*height as f32)
+            .into(),
+    };
+
+    let anchor = hovered.anchor;
+    let window_width = app.window_size.width.max(1.0);
+    let window_height = app.window_size.height.max(1.0);
+
+    iced::widget::float(content)
+        .translate(move |bounds, _viewport| {
+            let left = (anchor.x - bounds.width / 2.0)
+                .clamp(4.0, (window_width - bounds.width - 4.0).max(4.0));
+            let above = anchor.y - bounds.height - 5.0;
+            let top = if above >= 4.0 {
+                above
+            } else {
+                (anchor.y + 5.0).min((window_height - bounds.height - 4.0).max(4.0))
+            };
+            Vector::new(left - bounds.x, top - bounds.y)
+        })
         .into()
 }
 
@@ -648,7 +712,7 @@ fn composer(app: &App) -> Element<'_, Message> {
     let editor = text_input(&hint, &app.composer)
         .id(app.composer_id.clone())
         .on_input(Message::Composer)
-        .on_submit(Message::Send)
+        .on_submit(Message::ComposerSubmit)
         .size(14)
         .padding([8, 10])
         .width(Fill)
@@ -669,20 +733,101 @@ fn composer(app: &App) -> Element<'_, Message> {
     .align_y(Alignment::Center)
     .width(Fill);
 
-    container(
-        column![
-            toolbar,
-            row![editor, send]
-                .spacing(6)
-                .align_y(Alignment::Center)
-                .width(Fill),
-        ]
-        .spacing(4),
+    // Keep the suggestion slot in the column even when it is empty: the
+    // widget tree is reconciled by child position, so inserting a widget
+    // above the entry field would reset the text input state (caret and
+    // focus) every time the autocompletion appears. The placeholder must not
+    // have a fixed zero size, because `Column::push` silently drops void
+    // children (a fixed 0 length means "void") and the slot would disappear.
+    let suggestions: Element<'_, Message> =
+        totoz_suggestions(app).unwrap_or_else(|| Space::new().height(Length::Shrink).into());
+    let content = column![
+        toolbar,
+        suggestions,
+        row![editor, send]
+            .spacing(6)
+            .align_y(Alignment::Center)
+            .width(Fill),
+    ]
+    .spacing(4);
+
+    container(content)
+        .style(colors::panel)
+        .padding(6)
+        .width(Fill)
+        .into()
+}
+
+/// Inline totoz autocompletion, attached right above the entry field. Nothing
+/// is rendered while the list is empty, so an unknown prefix leaves no trace.
+fn totoz_suggestions(app: &App) -> Option<Element<'_, Message>> {
+    if !app.totoz_suggest.visible() {
+        return None;
+    }
+    let query = app.totoz_suggest.query.to_lowercase();
+    let mut list = column![].spacing(1).width(Fill);
+    for (index, totoz) in app.totoz_suggest.results.iter().enumerate() {
+        let active = app.totoz_suggest.selected == Some(index);
+        let name = totoz.name.clone();
+        // Keep a fixed box for the thumbnail so rows do not jump while the
+        // image is being fetched. The image itself is scaled down to fit.
+        let preview: Element<'_, Message> = match app.totoz.images.get(&totoz.name) {
+            Some(thumbnail) => image(thumbnail.first_frame().clone())
+                .width(Length::Fixed(24.0))
+                .height(Length::Fixed(24.0))
+                .content_fit(iced::ContentFit::Contain)
+                .into(),
+            None => Space::new().width(24).height(24).into(),
+        };
+        let label = totoz_suggestion_label(&totoz.name, &query);
+        list = list.push(
+            button(
+                row![preview, label]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+                    .width(Fill),
+            )
+            .on_press(Message::TotozSuggestPick(name))
+            .style(move |theme, status| colors::totoz_suggestion(theme, status, active))
+            .width(Fill)
+            .padding([5, 8]),
+        );
+    }
+    Some(
+        container(list)
+            .style(colors::totoz_suggestion_panel)
+            .padding(4)
+            .width(Fill)
+            .into(),
     )
-    .style(colors::panel)
-    .padding(6)
-    .width(Fill)
-    .into()
+}
+
+/// Render `[:name]` with the already typed part in normal weight and the
+/// predicted remainder in bold, as recommended for autocomplete suggestions.
+fn totoz_suggestion_label<'a>(name: &str, query: &str) -> Element<'a, Message> {
+    let lower = name.to_lowercase();
+    let split = lower
+        .find(query)
+        .map(|start| start + query.len())
+        .filter(|split| name.is_char_boundary(*split))
+        .unwrap_or(0);
+    let (typed, predicted) = name.split_at(split);
+    let font = Font {
+        weight: iced::font::Weight::Bold,
+        ..Font::DEFAULT
+    };
+    let mut spans = vec![span(format!("[:{typed}")).size(13).color(colors::TOTOZ)];
+    if predicted.is_empty() {
+        spans.push(span("]").size(13).color(colors::TOTOZ));
+    } else {
+        spans.push(
+            span(format!("{predicted}]"))
+                .size(13)
+                .color(colors::TOTOZ)
+                .font(font),
+        );
+    }
+    iced::widget::text::Rich::<'_, (), Message, _>::with_spans(spans).into()
 }
 
 fn icon_button<'a>(glyph: &'a str, message: Message) -> Element<'a, Message> {
@@ -1195,6 +1340,7 @@ fn totoz_view(app: &App) -> Element<'_, Message> {
 
     let search = row![
         text_input("chercher des totoz", &app.totoz.query)
+            .id(app.totoz_search_id.clone())
             .on_input(Message::TotozQuery)
             .on_submit(Message::TotozSearch)
             .width(Fill)
@@ -1280,6 +1426,7 @@ fn emoji_view(app: &App) -> Element<'_, Message> {
 
     let search = row![
         text_input("chercher un emoji", &app.emoji.query)
+            .id(app.emoji_search_id.clone())
             .on_input(Message::EmojiQuery)
             .on_submit(Message::EmojiSearch)
             .width(Fill)
@@ -1306,4 +1453,47 @@ fn emoji_view(app: &App) -> Element<'_, Message> {
     .width(Fill)
     .height(Fill)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::advanced::widget::Tree;
+    use iced::widget::{column, text_input};
+
+    type Paragraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
+
+    /// Mirror the composer structure: toolbar, suggestion slot, entry field.
+    fn composer_with_suggestions(
+        suggestions: Option<Element<'static, ()>>,
+    ) -> Element<'static, ()> {
+        let slot: Element<'static, ()> =
+            suggestions.unwrap_or_else(|| Space::new().height(Length::Shrink).into());
+        column![
+            text("toolbar"),
+            slot,
+            row![text_input("hint", "hello").id(iced::widget::Id::new("composer"))],
+        ]
+        .into()
+    }
+
+    #[test]
+    fn entry_field_keeps_focus_when_the_suggestion_slot_changes() {
+        let mut tree = Tree::new(composer_with_suggestions(None).as_widget());
+
+        // The placeholders are kept in the tree, so the entry field is always
+        // the third column child and can be focused directly.
+        let entry = &mut tree.children[2].children[0];
+        entry
+            .state
+            .downcast_mut::<text_input::State<Paragraph>>()
+            .focus();
+
+        let slot: Element<'static, ()> = container(column![text("[:duck]")]).height(20).into();
+        tree.diff(composer_with_suggestions(Some(slot)).as_widget());
+
+        let entry = &tree.children[2].children[0];
+        let state = entry.state.downcast_ref::<text_input::State<Paragraph>>();
+        assert!(state.is_focused(), "the entry field lost its focus state");
+    }
 }

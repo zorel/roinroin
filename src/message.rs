@@ -737,7 +737,7 @@ fn url_label(href: &str) -> String {
     }
 }
 
-fn decode_entities(value: &str) -> String {
+pub(crate) fn decode_entities(value: &str) -> String {
     if !value.contains('&') {
         return value.to_owned();
     }
