@@ -67,11 +67,16 @@ fn post_preview_overlay(app: &App) -> Element<'_, Message> {
         .iter()
         .position(|item| item == key)
         .unwrap_or(0);
-    let content = post_card_body(app, key.clone(), index, false);
+    let content = post_card_body(app, key.clone(), index, CardMode::PREVIEW);
     let window_width = app.window_size.width.max(1.0);
     let window_height = app.window_size.height.max(1.0);
     let content_left = app.sidebar_width + 6.0;
-    let content_width = (window_width - content_left).max(1.0);
+    let conversations = if app.conversations.is_empty() {
+        0.0
+    } else {
+        conversation_panel_width(app) + 6.0
+    };
+    let content_width = (window_width - content_left - conversations).max(1.0);
     let width = (content_width - 64.0).clamp(320.0, 760.0);
     let left = content_left + (content_width - width) / 2.0;
     let top = 8.0;
@@ -187,7 +192,7 @@ fn main_view(app: &App) -> Element<'_, Message> {
     .on_press(Message::SidebarDragStart)
     .interaction(mouse::Interaction::ResizingHorizontally);
 
-    let body = row![
+    let mut body = row![
         container(sidebar(app))
             .width(Length::Fixed(app.sidebar_width))
             .height(Fill)
@@ -199,7 +204,140 @@ fn main_view(app: &App) -> Element<'_, Message> {
             .padding(12),
     ]
     .height(Fill);
+    if !app.conversations.is_empty() {
+        body = body.push(
+            container(
+                container(rule::vertical(1).style(colors::rule))
+                    .width(6)
+                    .height(Fill)
+                    .align_x(Alignment::Center),
+            )
+            .height(Fill),
+        );
+        body = body.push(
+            container(conversation_panels(app))
+                .width(Length::Fixed(conversation_panel_width(app)))
+                .height(Fill)
+                .padding(iced::Padding {
+                    top: 6.0,
+                    right: 6.0,
+                    bottom: 6.0,
+                    left: 0.0,
+                }),
+        );
+    }
     body.into()
+}
+
+/// The right column grows with the number of open conversations but leaves
+/// enough room for the timeline. Individual panes share the width equally.
+fn conversation_panel_width(app: &App) -> f32 {
+    const MIN_PANE_WIDTH: f32 = 220.0;
+    const TIMELINE_MIN_WIDTH: f32 = 300.0;
+    let count = app.conversations.len().max(1) as f32;
+    let workspace = (app.window_size.width - app.sidebar_width).max(1.0);
+    let desired = 360.0 + 240.0 * (count - 1.0);
+    let max = (workspace - TIMELINE_MIN_WIDTH).max(MIN_PANE_WIDTH);
+    desired.clamp(MIN_PANE_WIDTH, max)
+}
+
+fn conversation_panels(app: &App) -> Element<'_, Message> {
+    let mut panes = row![].spacing(6).height(Fill).width(Fill);
+    for pane in &app.conversations {
+        panes = panes.push(conversation_pane(app, pane));
+    }
+    container(panes).width(Fill).height(Fill).into()
+}
+
+fn conversation_pane<'a>(
+    app: &'a App,
+    pane: &'a crate::app::ConversationPane,
+) -> Element<'a, Message> {
+    let root = app.analysis.conversation_root(&pane.anchor);
+    let keys = app.conversation_keys(&pane.anchor);
+    // A thread can span several boards through `@tribune` references. Show
+    // every board involved, in the order their first post appears.
+    let mut boards: Vec<&str> = Vec::new();
+    for key in &keys {
+        if let Some(post) = app.posts.get(key) {
+            if !boards.contains(&post.tribune.as_str()) {
+                boards.push(&post.tribune);
+            }
+        }
+    }
+    let header_post = app
+        .posts
+        .get(&root)
+        .or_else(|| keys.first().and_then(|key| app.posts.get(key)));
+    if boards.is_empty() {
+        if let Some(post) = header_post {
+            boards.push(&post.tribune);
+        }
+    }
+    let title = match header_post {
+        Some(post) if boards.is_empty() => {
+            format!("{} · {}", post.time().clock(), post.display_identity())
+        }
+        Some(post) => format!(
+            "{} · {} · {}",
+            boards.join(", "),
+            post.time().clock(),
+            post.display_identity()
+        ),
+        None => "conversation".to_owned(),
+    };
+    let header = row![
+        emoji_rich(title)
+            .size(12)
+            .width(Fill)
+            .wrapping(iced::widget::text::Wrapping::Word),
+        text(keys.len().to_string())
+            .size(10)
+            .style(colors::muted_text),
+        button(text("×").size(14))
+            .on_press(Message::CloseConversation(pane.anchor.clone()))
+            .style(colors::button_ghost)
+            .padding([0, 4]),
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center)
+    .width(Fill);
+
+    let mut list = column![].spacing(0).width(Fill);
+    if keys.is_empty() {
+        list = list.push(
+            container(
+                text("Aucun message visible dans cette conversation.")
+                    .size(12)
+                    .style(colors::muted_text),
+            )
+            .padding(8)
+            .width(Fill),
+        );
+    } else {
+        for (index, key) in keys.iter().enumerate() {
+            list = list.push(conversation_post_card(app, key.clone(), index));
+        }
+    }
+
+    let anchor = pane.anchor.clone();
+    let posts = scrollable(container(list).padding([2, 4]))
+        .id(pane.scroll_id())
+        .height(Fill)
+        .on_scroll(move |viewport| {
+            let offset = viewport.absolute_offset();
+            let at_bottom =
+                offset.y + viewport.bounds().height + 24.0 >= viewport.content_bounds().height;
+            Message::ConversationScrolled(anchor.clone(), at_bottom)
+        })
+        .style(colors::scrollable_style);
+
+    container(column![header, posts].spacing(4).height(Fill))
+        .style(colors::panel)
+        .padding(6)
+        .width(Fill)
+        .height(Fill)
+        .into()
 }
 
 fn sidebar(app: &App) -> Element<'_, Message> {
@@ -408,8 +546,27 @@ const CLOCK_WIDTH: f32 = 78.0;
 const STATUS_WIDTH: f32 = 18.0;
 const IDENTITY_WIDTH: f32 = 120.0;
 
+/// Rendering options for a post row. Conversation panes keep link clicks but
+/// skip the timeline-only hover previews.
+#[derive(Clone, Copy)]
+struct CardMode {
+    interactive: bool,
+    link_hover: bool,
+}
+
+impl CardMode {
+    const MAIN: Self = Self {
+        interactive: true,
+        link_hover: true,
+    };
+    const PREVIEW: Self = Self {
+        interactive: false,
+        link_hover: false,
+    };
+}
+
 fn post_card<'a>(app: &'a App, key: PostKey, index: usize) -> Element<'a, Message> {
-    let content = post_card_body(app, key.clone(), index, true);
+    let content = post_card_body(app, key.clone(), index, CardMode::MAIN);
     let visible_key = key.key();
     crate::visible::Visible::new(
         content,
@@ -424,7 +581,7 @@ fn post_card_body<'a>(
     app: &'a App,
     key: PostKey,
     index: usize,
-    interactive: bool,
+    mode: CardMode,
 ) -> Element<'a, Message> {
     let Some(post) = app.posts.get(&key) else {
         return Space::new().into();
@@ -524,10 +681,11 @@ fn post_card_body<'a>(
         .size(POST_FONT_SIZE)
         .width(Length::Fixed(IDENTITY_WIDTH))
         .wrapping(iced::widget::text::Wrapping::None);
-    if interactive {
-        identity = identity
-            .on_link_click(Message::LinkClicked)
-            .on_link_hover(Message::HoverLink);
+    if mode.interactive {
+        identity = identity.on_link_click(Message::LinkClicked);
+    }
+    if mode.link_hover {
+        identity = identity.on_link_hover(Message::HoverLink);
     }
 
     let mut spans: Vec<Span<'a, LinkAction>> = Vec::new();
@@ -542,16 +700,17 @@ fn post_card_body<'a>(
                 }),
         );
     } else if let Some(parsed) = parsed {
-        spans.extend(message_spans(app, &key, parsed));
+        spans.extend(message_spans(app, &key, parsed, POST_FONT_SIZE));
     }
 
     let mut message = HoverRich::with_spans(spans)
         .size(POST_FONT_SIZE)
         .width(Fill);
-    if interactive {
-        message = message
-            .on_link_click(Message::LinkClicked)
-            .on_link_hover(Message::HoverLink);
+    if mode.interactive {
+        message = message.on_link_click(Message::LinkClicked);
+    }
+    if mode.link_hover {
+        message = message.on_link_hover(Message::HoverLink);
     }
 
     let rail = container(Space::new())
@@ -579,8 +738,9 @@ fn post_card_body<'a>(
     .width(Fill)
     .style(move |theme| colors::post_row(theme, selected, hovered, hidden, index));
 
-    if interactive {
+    if mode.interactive {
         let hover_key = key.clone();
+        let right_click_key = key.clone();
         iced::widget::mouse_area(card)
             .on_move(move |point| {
                 if point.x <= 90.0 {
@@ -591,16 +751,143 @@ fn post_card_body<'a>(
             })
             .on_exit(Message::HoverExit)
             .on_press(Message::PostClicked(key))
+            .on_right_press(Message::PostRightClicked(right_click_key))
             .into()
     } else {
         card.into()
     }
 }
 
+/// A compact two-line card for narrow conversation panes: metadata on the
+/// first line, message on the second, so the text keeps a usable width even
+/// when the right column is split several times.
+fn conversation_post_card<'a>(app: &'a App, key: PostKey, index: usize) -> Element<'a, Message> {
+    const FONT_SIZE: f32 = 13.0;
+    let Some(post) = app.posts.get(&key) else {
+        return Space::new().into();
+    };
+    let Some(info) = app.analysis.info(&key) else {
+        return Space::new().into();
+    };
+    let parsed = app.parsed_display(&key);
+    let selected = app.selected.as_ref() == Some(&key);
+    let hovered =
+        app.hovered_post.as_ref() == Some(&key) || app.hovered_link_post.as_ref() == Some(&key);
+    let hidden = info.hidden;
+    let conversation_color = info
+        .color
+        .map(|index| colors::CONVERSATION[index % colors::CONVERSATION.len()])
+        .unwrap_or(colors::MUTED);
+    let clock_color = if selected || hovered {
+        Color::WHITE
+    } else if hidden {
+        colors::MUTED
+    } else {
+        colors::CLOCK
+    };
+
+    let mut top = row![text(post.time().clock())
+        .size(FONT_SIZE)
+        .font(Font {
+            family: iced::font::Family::Monospace,
+            weight: iced::font::Weight::Bold,
+            ..Font::DEFAULT
+        })
+        .color(clock_color),]
+    .spacing(5)
+    .align_y(Alignment::Center)
+    .width(Fill);
+
+    let (status, status_color) = if hidden {
+        ("🚫", colors::DANGER)
+    } else if info.is_mine {
+        ("★", colors::OWN_POST)
+    } else if info.is_reply {
+        ("↩", colors::ACCENT)
+    } else if info.is_bigorno {
+        ("📢", colors::BIGORNO)
+    } else if info.has_duck {
+        ("🦆", colors::ACCENT)
+    } else {
+        ("", colors::MUTED)
+    };
+    if !status.is_empty() {
+        top = top.push(text(status).size(FONT_SIZE).color(status_color).font(
+            if emoji_segments(status).iter().any(|(_, emoji)| *emoji) {
+                emoji_font()
+            } else {
+                Font::DEFAULT
+            },
+        ));
+    }
+    top = top.push(
+        emoji_rich(post.display_identity())
+            .size(FONT_SIZE)
+            .color(if hidden { colors::MUTED } else { colors::NAME })
+            .width(Fill),
+    );
+
+    let mut spans: Vec<Span<'a, LinkAction>> = Vec::new();
+    if hidden {
+        spans.push(
+            span("[message masqué]")
+                .size(FONT_SIZE)
+                .color(colors::MUTED)
+                .font(Font {
+                    style: iced::font::Style::Italic,
+                    ..Font::DEFAULT
+                }),
+        );
+    } else if let Some(parsed) = parsed {
+        spans.extend(message_spans(app, &key, parsed, FONT_SIZE));
+    }
+    let message = HoverRich::with_spans(spans)
+        .size(FONT_SIZE)
+        .width(Fill)
+        .on_link_click(Message::LinkClicked);
+
+    let rail = container(Space::new())
+        .width(3)
+        .height(Fill)
+        .style(move |_| iced::widget::container::Style {
+            background: Some(iced::Background::Color(conversation_color)),
+            border: iced::Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 1.0.into(),
+            },
+            ..iced::widget::container::Style::default()
+        });
+    let body = column![top, message].spacing(2).width(Fill);
+    let card = container(
+        row![rail, container(body).padding([3, 6]).width(Fill)]
+            .width(Fill)
+            .height(Length::Shrink),
+    )
+    .width(Fill)
+    .style(move |theme| colors::post_row(theme, selected, hovered, hidden, index));
+
+    let hover_key = key.clone();
+    let right_click_key = key.clone();
+    iced::widget::mouse_area(card)
+        .on_move(move |point| {
+            if point.x <= 75.0 {
+                Message::HoverPost(Some(hover_key.clone()))
+            } else {
+                Message::HoverPost(None)
+            }
+        })
+        .on_exit(Message::HoverExit)
+        .on_press(Message::PostClicked(key))
+        .on_right_press(Message::PostRightClicked(right_click_key))
+        .into()
+}
+
 fn message_spans<'a>(
     app: &'a App,
     key: &PostKey,
     parsed: &'a crate::message::ParsedMessage,
+    font_size: f32,
 ) -> Vec<Span<'a, LinkAction>> {
     let mut spans = Vec::new();
     let info = app.analysis.info(key);
@@ -623,7 +910,7 @@ fn message_spans<'a>(
                     text.as_str()
                 };
                 for (part, emoji) in emoji_segments(value) {
-                    let mut part_span = span(part).size(POST_FONT_SIZE);
+                    let mut part_span = span(part).size(font_size);
                     if emoji {
                         // General text fonts can contain a monochrome symbol
                         // or the letters of a flag without its emoji glyph.
@@ -665,7 +952,7 @@ fn message_spans<'a>(
             Token::Link { href, label } => {
                 for (part, emoji) in emoji_segments(label) {
                     let mut part_span = span(part)
-                        .size(POST_FONT_SIZE)
+                        .size(font_size)
                         .color(colors::LINK)
                         .underline(true)
                         .link(LinkAction::Url(href.clone()));
@@ -687,7 +974,7 @@ fn message_spans<'a>(
                     };
                     spans.push(
                         span(part)
-                            .size(POST_FONT_SIZE)
+                            .size(font_size)
                             .color(colors::TOTOZ)
                             .font(font)
                             .link(LinkAction::Totoz(name.clone())),
@@ -704,7 +991,7 @@ fn message_spans<'a>(
                 let highlighted = target
                     .as_ref()
                     .is_some_and(|target| highlighted_target == Some(target));
-                let mut value = span(reference.raw.as_str()).size(POST_FONT_SIZE);
+                let mut value = span(reference.raw.as_str()).size(font_size);
                 // Keep the same font weight in both states: a bold span is
                 // wider and would shift the rest of the message on hover.
                 value = if highlighted {
@@ -732,7 +1019,7 @@ fn message_spans<'a>(
                     };
                     spans.push(
                         span(part.to_owned())
-                            .size(POST_FONT_SIZE)
+                            .size(font_size)
                             .color(colors::BIGORNO)
                             .background(Color {
                                 a: 0.18,

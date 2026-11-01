@@ -3,7 +3,9 @@
 use super::*;
 
 impl App {
-    pub(super) fn ensure_analysis(&mut self) {
+    /// Rebuild the conversation index when needed. Returns whether the
+    /// analysis changed, so callers can refresh dependent panes only then.
+    pub(super) fn ensure_analysis(&mut self) -> bool {
         if self.analysis_dirty {
             self.prune_posts();
             self.baseline_history();
@@ -44,6 +46,9 @@ impl App {
             {
                 self.selected = None;
             }
+            true
+        } else {
+            false
         }
     }
 

@@ -54,6 +54,11 @@ et reprend les fonctions des clients existants `gb3tui`, `gb3-android` et
   même position ; si un login existe c'est lui qui est affiché, et son info/UA
   apparaît au survol ; sinon l'info courte est affichée ;
 - références inverses : sélectionner un post met en évidence ses réponses ;
+- `Maj+clic droit` sur n'importe quel post ouvre tout son arbre de discussion
+  dans un panneau à droite : racine, réponses, réponses aux réponses et toutes
+  les branches ; le panneau suit les nouveaux messages et se scinde en deux
+  colonnes quand un autre arbre est ouvert, avec les mêmes filtres que la
+  tribune ;
 - BML : `<b>`, `<i>`, `<u>`, `<s>`, `<tt>`, `<code>`, spoilers cliquables,
   liens bruts, liens `<a>`, entités HTML, bigornos `nick<` ;
 - totoz affichés par leur nom en vert ; au survol, l’image ou l’animation
@@ -76,6 +81,9 @@ et reprend les fonctions des clients existants `gb3tui`, `gb3-android` et
   droite ; le nom de la tribune et sa source servent d'indication dans le champ
   vide ;
 - raccourcis `Alt+…` pour insérer les balises de formatage ;
+- fermeture automatique des balises : taper `<b>`, `<i>`, `<u>`, `<s>`,
+  `<tt>`, `<code>` ou `<spoiler>` insère aussitôt la balise fermante et laisse
+  le curseur entre les deux ;
 - citation d'un post au clic sur son horloge, avec bascule automatique du
   suffixe `@tribune` quand on change de tribune ;
 - envoi par bouton, `Entrée` ou `Ctrl+Entrée`, restauration du brouillon si

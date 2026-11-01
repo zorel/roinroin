@@ -24,7 +24,7 @@ use crate::config::{
 };
 use crate::conversation::{self, Analysis};
 use crate::message::{self, ParsedMessage, Token};
-use crate::model::{quote_clock, Post, PostKey, SourceId, TribuneKey};
+use crate::model::{compare_posts, quote_clock, Post, PostKey, SourceId, TribuneKey};
 use crate::net;
 use crate::notify;
 
@@ -146,6 +146,27 @@ impl TotozImage {
 pub struct EmojiState {
     pub query: String,
     pub results: Vec<net::Emoji>,
+}
+
+/// A conversation kept open next to the timeline. The whole thread is derived
+/// from the analysis on every render, so new replies appear automatically.
+#[derive(Debug, Clone)]
+pub struct ConversationPane {
+    /// Post that was right-clicked. The root is resolved again on every
+    /// analysis rebuild so a newly discovered ancestor does not detach the
+    /// pane from the rest of its thread.
+    pub anchor: PostKey,
+    /// Stay at the bottom when new messages arrive; turned off as soon as the
+    /// user scrolls up to read older posts.
+    pub follow: bool,
+    /// Latest post already seen in this pane, used to detect arrivals.
+    last: Option<PostKey>,
+}
+
+impl ConversationPane {
+    pub fn scroll_id(&self) -> Id {
+        Id::from(format!("roinroin-conversation:{}", self.anchor.key()))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -302,11 +323,15 @@ pub enum Message {
     Tick,
     WindowEvent(window::Id, window::Event),
     Keyboard(keyboard::Event),
+    ModifiersChanged(keyboard::Modifiers),
     ServerInfo(String, Result<net::ServerInfo, String>),
     BoardPosts(String, Result<Vec<Post>, String>),
     Sse(String, net::SseEvent),
     SelectTribune(TribuneKey),
     PostClicked(PostKey),
+    PostRightClicked(PostKey),
+    ConversationScrolled(PostKey, bool),
+    CloseConversation(PostKey),
     ClearSelection,
     JumpTo(PostKey),
     ToggleBlockedMode,
@@ -374,6 +399,9 @@ pub struct App {
     pub(crate) analysis_dirty: bool,
     pub(crate) active: Option<TribuneKey>,
     pub(crate) selected: Option<PostKey>,
+    pub(crate) conversations: Vec<ConversationPane>,
+    pub(crate) conversations_dirty: bool,
+    pub(crate) shift_held: bool,
     pub(crate) hovered_post: Option<PostKey>,
     pub(crate) hovered_link_post: Option<PostKey>,
     pub(crate) hovered_info: Option<String>,
@@ -453,6 +481,9 @@ impl App {
             analysis_dirty: true,
             active: None,
             selected: None,
+            conversations: Vec::new(),
+            conversations_dirty: false,
+            shift_held: false,
             hovered_post: None,
             hovered_link_post: None,
             hovered_info: None,
@@ -708,6 +739,16 @@ impl App {
         }
     }
 
+    /// Whether a post passes the same filters as the main timeline.
+    pub fn post_visible(&self, key: &PostKey) -> bool {
+        let hidden = self
+            .analysis
+            .info(key)
+            .map(|info| info.hidden)
+            .unwrap_or(false);
+        !hidden || self.config.show_hidden || self.config.blocked_mode == BlockedMode::Gray
+    }
+
     pub fn visible_keys(&self) -> Vec<PostKey> {
         let Some(active) = &self.active else {
             return Vec::new();
@@ -715,16 +756,94 @@ impl App {
         self.analysis
             .posts_for(active)
             .iter()
-            .filter(|key| {
-                let hidden = self
-                    .analysis
-                    .info(key)
-                    .map(|info| info.hidden)
-                    .unwrap_or(false);
-                !hidden || self.config.show_hidden || self.config.blocked_mode == BlockedMode::Gray
-            })
+            .filter(|key| self.post_visible(key))
             .cloned()
             .collect()
+    }
+
+    /// The visible posts of the whole discussion tree containing `key`,
+    /// oldest first.
+    pub fn conversation_keys(&self, key: &PostKey) -> Vec<PostKey> {
+        let mut keys: Vec<PostKey> = self
+            .analysis
+            .conversation(key)
+            .into_iter()
+            .filter(|key| self.post_visible(key))
+            .collect();
+        keys.sort_by(
+            |left, right| match (self.posts.get(left), self.posts.get(right)) {
+                (Some(left_post), Some(right_post)) => {
+                    compare_posts(left_post, right_post).then_with(|| left.cmp(right))
+                }
+                _ => left.cmp(right),
+            },
+        );
+        keys
+    }
+
+    /// Open the conversation containing `key`, unless that conversation is
+    /// already displayed in a pane.
+    pub(super) fn open_conversation(&mut self, key: PostKey) {
+        if self
+            .conversations
+            .iter()
+            .any(|pane| self.analysis.conversation(&pane.anchor).contains(&key))
+        {
+            return;
+        }
+        self.conversations.push(ConversationPane {
+            anchor: key,
+            follow: true,
+            last: None,
+        });
+        self.conversations_dirty = true;
+    }
+
+    /// Drop panes whose post disappeared, merge panes that now belong to the
+    /// same discussion tree, and keep the remaining ones following replies.
+    pub(super) fn refresh_conversations(&mut self, tasks: &mut Vec<Task<Message>>) {
+        let mut trees: Vec<BTreeSet<PostKey>> = Vec::new();
+        self.conversations.retain(|pane| {
+            if !self.posts.contains_key(&pane.anchor) {
+                return false;
+            }
+            if trees.iter().any(|members| members.contains(&pane.anchor)) {
+                return false;
+            }
+            trees.push(
+                self.analysis
+                    .conversation(&pane.anchor)
+                    .into_iter()
+                    .collect(),
+            );
+            true
+        });
+        let latest: Vec<(PostKey, Option<PostKey>)> = self
+            .conversations
+            .iter()
+            .map(|pane| {
+                (
+                    pane.anchor.clone(),
+                    self.conversation_keys(&pane.anchor).last().cloned(),
+                )
+            })
+            .collect();
+        for (anchor, latest) in latest {
+            let Some(pane) = self
+                .conversations
+                .iter_mut()
+                .find(|pane| pane.anchor == anchor)
+            else {
+                continue;
+            };
+            if pane.last == latest {
+                continue;
+            }
+            pane.last = latest;
+            if pane.follow {
+                tasks.push(iced::widget::operation::snap_to_end(pane.scroll_id()));
+            }
+        }
     }
 
     pub fn parsed_display(&self, key: &PostKey) -> Option<&ParsedMessage> {
@@ -1102,6 +1221,71 @@ fn totoz_suggestion_term(text: &str) -> Option<&str> {
     Some(term)
 }
 
+/// Supported BML formatting tags, as recognized by the message scanner.
+const FORMATTING_TAGS: &[&str] = &[
+    "spoiler", "b", "strong", "i", "em", "s", "strike", "del", "u", "tt", "code",
+];
+
+/// Insert the matching closing tag as soon as the user completes an opening
+/// formatting tag. Only the inserted range is examined, so typing in the
+/// middle of the draft works and the caret naturally stays between both tags.
+fn auto_close_formatting_tag(previous: &str, current: &str) -> Option<String> {
+    if previous == current {
+        return None;
+    }
+    let prefix = previous
+        .chars()
+        .zip(current.chars())
+        .take_while(|(left, right)| left == right)
+        .map(|(character, _)| character.len_utf8())
+        .sum::<usize>();
+    let suffix = previous[prefix..]
+        .chars()
+        .rev()
+        .zip(current[prefix..].chars().rev())
+        .take_while(|(left, right)| left == right)
+        .map(|(character, _)| character.len_utf8())
+        .sum::<usize>();
+    let inserted_end = current.len().checked_sub(suffix)?;
+    if inserted_end <= prefix {
+        // Pure deletion.
+        return None;
+    }
+
+    let before = &current[..inserted_end];
+    let start = before.rfind('<')?;
+    let tag = &before[start..];
+    if !tag.ends_with('>') {
+        return None;
+    }
+    let name = &tag[1..tag.len() - 1];
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    let lower = name.to_ascii_lowercase();
+    if !FORMATTING_TAGS.contains(&lower.as_str()) {
+        return None;
+    }
+
+    let closing = format!("</{name}>");
+    if current[inserted_end..]
+        .to_ascii_lowercase()
+        .starts_with(&closing.to_ascii_lowercase())
+    {
+        return None;
+    }
+
+    let mut result = String::with_capacity(current.len() + closing.len());
+    result.push_str(&current[..inserted_end]);
+    result.push_str(&closing);
+    result.push_str(&current[inserted_end..]);
+    Some(result)
+}
+
 /// Search the configured totoz server, falling back to a gb2c relay when the
 /// server has no direct match. Shared by the totoz screen and the inline
 /// autocompletion.
@@ -1129,6 +1313,7 @@ async fn search_totoz_any(
 fn keyboard_shortcut(event: keyboard::Event) -> Option<Message> {
     match event {
         keyboard::Event::KeyPressed { .. } => Some(Message::Keyboard(event)),
+        keyboard::Event::ModifiersChanged(modifiers) => Some(Message::ModifiersChanged(modifiers)),
         _ => None,
     }
 }
@@ -1243,5 +1428,53 @@ mod tests {
             .map(|index| totoz(&format!("duck{index}")))
             .collect();
         assert_eq!(rank_totoz_suggestions(results, "duck", 8).len(), 8);
+    }
+
+    #[test]
+    fn completed_opening_tags_are_closed() {
+        assert_eq!(
+            auto_close_formatting_tag("<b", "<b>").as_deref(),
+            Some("<b></b>")
+        );
+        assert_eq!(
+            auto_close_formatting_tag("hello <spoiler", "hello <spoiler>").as_deref(),
+            Some("hello <spoiler></spoiler>")
+        );
+        assert_eq!(
+            auto_close_formatting_tag("<strong", "<strong>").as_deref(),
+            Some("<strong></strong>")
+        );
+        // Preserve the case the user typed.
+        assert_eq!(
+            auto_close_formatting_tag("<I", "<I>").as_deref(),
+            Some("<I></I>")
+        );
+    }
+
+    #[test]
+    fn completion_works_in_the_middle_of_the_draft() {
+        assert_eq!(
+            auto_close_formatting_tag("a <b c", "a <b> c").as_deref(),
+            Some("a <b></b> c")
+        );
+        assert_eq!(
+            auto_close_formatting_tag("<b><i", "<b><i>").as_deref(),
+            Some("<b><i></i>")
+        );
+    }
+
+    #[test]
+    fn completed_tags_are_not_closed_twice() {
+        assert_eq!(auto_close_formatting_tag("<b", "<b></b>"), None);
+        assert_eq!(auto_close_formatting_tag("<b</b>", "<b></b>"), None);
+    }
+
+    #[test]
+    fn unsupported_or_incomplete_tags_are_left_alone() {
+        assert_eq!(auto_close_formatting_tag("<br", "<br>"), None);
+        assert_eq!(auto_close_formatting_tag("<foo", "<foo>"), None);
+        assert_eq!(auto_close_formatting_tag("<b", "<b"), None);
+        assert_eq!(auto_close_formatting_tag("</b", "</b>"), None);
+        assert_eq!(auto_close_formatting_tag("hello", "hell"), None);
     }
 }
