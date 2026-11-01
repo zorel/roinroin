@@ -340,7 +340,7 @@ pub enum Message {
     MarkAllRead,
     Scrolled(f32),
     Composer(String),
-    ComposerCaret(usize),
+    ComposerCursor(usize, Option<(usize, usize)>),
     ComposerSubmit,
     Insert(String),
     TotozPicked(String),
@@ -422,6 +422,7 @@ pub struct App {
     pub(crate) scroll_offset: f32,
     pub(crate) composer: String,
     pub(crate) composer_caret: usize,
+    pub(crate) composer_selection: Option<(usize, usize)>,
     pub(crate) totoz_suggest: TotozSuggest,
     pub(crate) draft_dirty: bool,
     pub(crate) state_dirty: bool,
@@ -473,6 +474,7 @@ impl App {
         let mut app = Self {
             composer: config.draft.clone(),
             composer_caret: config.draft.graphemes(true).count(),
+            composer_selection: None,
             totoz_suggest: TotozSuggest::default(),
             settings: SettingsDraft::from_config(&config),
             config,
@@ -1048,19 +1050,20 @@ impl App {
         }
         if alt {
             if let keyboard::Key::Character(character) = key {
-                let (prefix, suffix) = match character.to_lowercase().as_str() {
-                    "b" => ("<b>", "</b>"),
-                    "i" => ("<i>", "</i>"),
-                    "u" => ("<u>", "</u>"),
-                    "s" => ("<s>", "</s>"),
-                    "t" => ("<tt>", "</tt>"),
-                    "c" => ("<code>", "</code>"),
-                    "p" => ("<spoiler>", "</spoiler>"),
-                    "m" => ("====> <b>Moment</b> <====", ""),
-                    "a" => ("_o/* <b>BLAM</b>! ", ""),
+                match character.to_lowercase().as_str() {
+                    "b" => return vec![self.insert_formatting("<b>", "</b>")],
+                    "i" => return vec![self.insert_formatting("<i>", "</i>")],
+                    "u" => return vec![self.insert_formatting("<u>", "</u>")],
+                    "s" => return vec![self.insert_formatting("<s>", "</s>")],
+                    "t" => return vec![self.insert_formatting("<tt>", "</tt>")],
+                    "c" => return vec![self.insert_formatting("<code>", "</code>")],
+                    "p" => return vec![self.insert_formatting("<spoiler>", "</spoiler>")],
+                    "m" => return vec![self.insert_moment()],
+                    "a" => {
+                        return vec![Task::done(Message::Insert("_o/* <b>BLAM</b>! ".to_owned()))]
+                    }
                     _ => return Vec::new(),
-                };
-                return vec![Task::done(Message::Insert(format!("{prefix}{suffix}")))];
+                }
             }
         }
         Vec::new()

@@ -80,7 +80,10 @@ et reprend les fonctions des clients existants `gb3tui`, `gb3-android` et
 - éditeur sur une seule ligne avec brouillon persistant, bouton « Envoyer » à
   droite ; le nom de la tribune et sa source servent d'indication dans le champ
   vide ;
-- raccourcis `Alt+…` pour insérer les balises de formatage ;
+- raccourcis `Alt+…` pour insérer les balises de formatage : le curseur est
+  placé entre les deux balises, ou le texte sélectionné est encadré par
+  celles-ci ; `Alt+M` insère un moment, en ajoutant la sélection après le mot
+  « Moment » le cas échéant ;
 - fermeture automatique des balises : taper `<b>`, `<i>`, `<u>`, `<s>`,
   `<tt>`, `<code>` ou `<spoiler>` insère aussitôt la balise fermante et laisse
   le curseur entre les deux ;

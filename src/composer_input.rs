@@ -9,8 +9,12 @@ use iced::advanced::text;
 use iced::advanced::widget::operation::TextInput as _;
 use iced::advanced::widget::tree::{self, Tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget};
+use iced::keyboard;
 use iced::widget::text_input::{self, cursor, Value};
 use iced::{Element, Event, Length, Rectangle, Size, Vector};
+
+type CursorCallback<'a, Message> = Box<dyn Fn(usize, Option<(usize, usize)>) -> Message + 'a>;
+type ShortcutCallback<'a, Message> = Box<dyn Fn(keyboard::Event) -> Message + 'a>;
 
 pub struct ComposerInput<'a, Message, Theme = iced::Theme, Renderer = iced::Renderer>
 where
@@ -18,7 +22,9 @@ where
 {
     content: Element<'a, Message, Theme, Renderer>,
     cursor: usize,
-    on_cursor: Box<dyn Fn(usize) -> Message + 'a>,
+    selection: Option<(usize, usize)>,
+    on_cursor: CursorCallback<'a, Message>,
+    on_shortcut: ShortcutCallback<'a, Message>,
 }
 
 impl<'a, Message, Theme, Renderer> ComposerInput<'a, Message, Theme, Renderer>
@@ -28,12 +34,16 @@ where
     pub fn new(
         content: impl Into<Element<'a, Message, Theme, Renderer>>,
         cursor: usize,
-        on_cursor: impl Fn(usize) -> Message + 'a,
+        selection: Option<(usize, usize)>,
+        on_cursor: impl Fn(usize, Option<(usize, usize)>) -> Message + 'a,
+        on_shortcut: impl Fn(keyboard::Event) -> Message + 'a,
     ) -> Self {
         Self {
             content: content.into(),
             cursor,
+            selection,
             on_cursor: Box::new(on_cursor),
+            on_shortcut: Box::new(on_shortcut),
         }
     }
 }
@@ -90,6 +100,24 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        // The text input would insert the character and capture the event, so
+        // the application-level keyboard subscription would never see Alt+…
+        // formatting shortcuts. Intercept them before the child gets the key.
+        if let Event::Keyboard(
+            keyboard_event @ keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(character),
+                modifiers,
+                ..
+            },
+        ) = event
+        {
+            if modifiers.alt() && !modifiers.control() && is_formatting_shortcut(character) {
+                shell.publish((self.on_shortcut)(keyboard_event.clone()));
+                shell.capture_event();
+                return;
+            }
+        }
+
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -108,12 +136,15 @@ where
             return;
         }
         let value = Value::new(input.text());
-        let caret = match input.cursor().state(&value) {
-            cursor::State::Index(index) => index,
-            cursor::State::Selection { start, end } => start.min(end),
+        let (caret, selection) = match input.cursor().state(&value) {
+            cursor::State::Index(index) => (index, None),
+            cursor::State::Selection { start, end } => {
+                let (start, end) = (start.min(end), start.max(end));
+                (start, Some((start, end)))
+            }
         };
-        if caret != self.cursor {
-            shell.publish((self.on_cursor)(caret));
+        if caret != self.cursor || selection != self.selection {
+            shell.publish((self.on_cursor)(caret, selection));
         }
     }
 
@@ -183,6 +214,13 @@ where
             translation,
         )
     }
+}
+
+fn is_formatting_shortcut(character: &str) -> bool {
+    matches!(
+        character.to_lowercase().as_str(),
+        "b" | "i" | "u" | "s" | "t" | "c" | "p" | "m" | "a"
+    )
 }
 
 impl<'a, Message, Theme, Renderer> From<ComposerInput<'a, Message, Theme, Renderer>>

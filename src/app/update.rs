@@ -411,8 +411,14 @@ impl App {
                 self.draft_dirty = true;
                 tasks.extend(self.refresh_totoz_suggest());
             }
-            Message::ComposerCaret(caret) => {
-                self.composer_caret = caret.min(self.composer.graphemes(true).count());
+            Message::ComposerCursor(caret, selection) => {
+                let length = self.composer.graphemes(true).count();
+                self.composer_caret = caret.min(length);
+                self.composer_selection = selection.and_then(|(start, end)| {
+                    let start = start.min(length);
+                    let end = end.min(length);
+                    (start < end).then_some((start, end))
+                });
             }
             Message::ComposerSubmit => {
                 if self.totoz_suggest.visible() {

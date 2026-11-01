@@ -1115,7 +1115,9 @@ fn composer(app: &App) -> Element<'_, Message> {
             .width(Fill)
             .style(colors::text_input_style),
         app.composer_caret,
-        Message::ComposerCaret,
+        app.composer_selection,
+        Message::ComposerCursor,
+        Message::Keyboard,
     );
 
     let send = button(container(text("Envoyer").size(14)).center_y(Fill))
