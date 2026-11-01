@@ -111,6 +111,7 @@ Prérequis :
 
 - Rust **1.88 ou plus** (`rustup` recommandé) ;
 - un environnement graphique X11 ou Wayland ;
+- une police emoji couleur (Noto Color Emoji recommandé) pour les emojis et drapeaux dans les posts ;
 - éventuellement `libxkbcommon` et les bibliothèques Wayland/X11 de la
   distribution (winit les utilise) ;
 - un démon de notifications pour l'intégration bureau (GNOME, KDE, mako,

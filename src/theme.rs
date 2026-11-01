@@ -14,6 +14,7 @@ pub const NAME: Color = Color::from_rgb8(0xcc, 0x78, 0x32);
 pub const MUTED: Color = Color::from_rgb8(0xa0, 0xa0, 0xa0);
 pub const DANGER: Color = Color::from_rgb8(0xff, 0x5f, 0x5f);
 pub const SUCCESS: Color = Color::from_rgb8(0x6a, 0x87, 0x59);
+pub const OWN_POST: Color = Color::from_rgb8(0xf4, 0xc5, 0x42);
 pub const LINK: Color = Color::from_rgb8(0x4e, 0xad, 0xf1);
 pub const TOTOZ: Color = Color::from_rgb8(0x6a, 0x87, 0x59);
 pub const BIGORNO: Color = Color::from_rgb8(0xff, 0x5f, 0x5f);

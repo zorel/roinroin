@@ -7,6 +7,7 @@ use std::fmt;
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::Europe::Paris;
 use serde::{Deserialize, Serialize};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Where a tribune comes from. A gb2c server aggregates several bouchots;
 /// a direct board is read and written without any intermediary.
@@ -235,11 +236,14 @@ pub fn quote_clock(post: &Post) -> String {
 }
 
 pub fn trim_identity(identity: &str, max_chars: usize) -> String {
-    let count = identity.chars().count();
+    if max_chars == 0 {
+        return String::new();
+    }
+    let count = identity.graphemes(true).count();
     if count <= max_chars {
         return identity.to_owned();
     }
-    let mut result: String = identity.chars().take(max_chars.saturating_sub(1)).collect();
+    let mut result: String = identity.graphemes(true).take(max_chars - 1).collect();
     result.push('…');
     result
 }
@@ -377,6 +381,9 @@ mod tests {
     #[test]
     fn trims_with_ellipsis() {
         assert_eq!(trim_identity("abcdefghij", 5), "abcd…");
+        assert_eq!(trim_identity("abc🇫🇷def", 5), "abc🇫🇷…");
+        assert_eq!(trim_identity("x👩‍💻y", 2), "x…");
+        assert_eq!(trim_identity("abc", 0), "");
     }
 
     #[test]

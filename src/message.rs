@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 
 use chrono::{NaiveDate, NaiveTime};
 use regex::Regex;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::model::{NorlogeKind, NorlogeRef};
 
@@ -723,8 +724,8 @@ fn url_label(href: &str) -> String {
         } else {
             format!("{host}{path}")
         };
-        if label.chars().count() > 44 {
-            let mut shortened: String = label.chars().take(43).collect();
+        if label.graphemes(true).count() > 44 {
+            let mut shortened: String = label.graphemes(true).take(43).collect();
             shortened.push('…');
             shortened
         } else if label.is_empty() {

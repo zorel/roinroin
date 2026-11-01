@@ -8,6 +8,9 @@ use iced::widget::{
     text_input, Space,
 };
 use iced::{mouse, Alignment, Color, Element, Fill, Font, Length, Vector};
+use unicode_properties::emoji::EmojiStatus;
+use unicode_properties::UnicodeEmoji;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{
     App, ConnectionStatus, LinkAction, LinkPreview, Message, Screen, SettingsMessage,
@@ -140,7 +143,7 @@ fn link_preview_overlay(app: &App) -> Element<'_, Message> {
                 .style(colors::panel)
                 .into()
         }
-        LinkPreview::Title(title) => container(text(title.as_str()).size(13))
+        LinkPreview::Title(title) => container(emoji_rich(title).size(13))
             .padding(6)
             .max_width(420)
             .style(colors::panel)
@@ -239,7 +242,7 @@ fn sidebar(app: &App) -> Element<'_, Message> {
         );
     }
     for (group, server_url, tribunes) in groups {
-        let mut header = row![text(group.to_uppercase())
+        let mut header = row![emoji_rich(group.to_uppercase())
             .size(10)
             .style(colors::muted_text)
             .width(Fill)]
@@ -261,7 +264,7 @@ fn sidebar(app: &App) -> Element<'_, Message> {
                 );
             }
             if bigorno {
-                badges = badges.push(text("📢").size(12));
+                badges = badges.push(text("📢").size(12).font(emoji_font()));
             }
             if reply {
                 badges = badges.push(text("↩").size(12));
@@ -271,7 +274,7 @@ fn sidebar(app: &App) -> Element<'_, Message> {
                 right = right.push(status_icon(app.board_status(name)));
             }
             let label = row![
-                text(tribune.name.clone())
+                emoji_rich(&tribune.name)
                     .size(14)
                     .width(Fill)
                     .wrapping(iced::widget::text::Wrapping::Word),
@@ -380,7 +383,7 @@ fn welcome_view(app: &App) -> Element<'_, Message> {
             ]
             .spacing(8),
             Space::new().height(12),
-            text(format!(
+            emoji_rich(format!(
                 "Serveur : {}",
                 app.config
                     .servers
@@ -464,7 +467,7 @@ fn post_card_body<'a>(
     let (status, status_color) = if hidden {
         ("🚫", colors::DANGER)
     } else if info.is_mine {
-        ("⭐", colors::SUCCESS)
+        ("★", colors::OWN_POST)
     } else if info.is_reply {
         ("↩", colors::ACCENT)
     } else if info.is_bigorno {
@@ -477,26 +480,47 @@ fn post_card_body<'a>(
     let status_slot: Element<'_, Message> = if status.is_empty() {
         Space::new().width(STATUS_WIDTH).into()
     } else {
-        container(text(status).size(POST_FONT_SIZE).color(status_color))
-            .width(STATUS_WIDTH)
-            .align_x(Alignment::Center)
-            .into()
+        let size = if info.is_mine && !hidden {
+            POST_FONT_SIZE + 2.0
+        } else {
+            POST_FONT_SIZE
+        };
+        container(text(status).size(size).color(status_color).font(
+            if emoji_segments(status).iter().any(|(_, emoji)| *emoji) {
+                emoji_font()
+            } else {
+                Font::DEFAULT
+            },
+        ))
+        .width(STATUS_WIDTH)
+        .align_x(Alignment::Center)
+        .into()
     };
 
     // Fixed clock, status and identity columns: the message always starts at
     // the same x position, whatever the nickname or UA length.
     let identity_name = crate::model::trim_identity(&post.display_identity(), 16);
-    let mut identity_span = span(identity_name)
-        .size(POST_FONT_SIZE)
-        .color(if hidden { colors::MUTED } else { colors::NAME })
-        .font(Font {
-            weight: iced::font::Weight::Bold,
-            ..Font::DEFAULT
-        });
-    if !post.identity().is_empty() {
-        identity_span = identity_span.link(LinkAction::Info(post.info.clone(), key.clone()));
-    }
-    let mut identity = HoverRich::with_spans(vec![identity_span])
+    let identity_spans = emoji_segments(&identity_name)
+        .into_iter()
+        .map(|(part, emoji)| {
+            let mut part_span = span(part.to_owned())
+                .size(POST_FONT_SIZE)
+                .color(if hidden { colors::MUTED } else { colors::NAME })
+                .font(if emoji {
+                    emoji_font()
+                } else {
+                    Font {
+                        weight: iced::font::Weight::Bold,
+                        ..Font::DEFAULT
+                    }
+                });
+            if !post.identity().is_empty() {
+                part_span = part_span.link(LinkAction::Info(post.info.clone(), key.clone()));
+            }
+            part_span
+        })
+        .collect();
+    let mut identity = HoverRich::with_spans(identity_spans)
         .size(POST_FONT_SIZE)
         .width(Length::Fixed(IDENTITY_WIDTH))
         .wrapping(iced::widget::text::Wrapping::None);
@@ -598,57 +622,77 @@ fn message_spans<'a>(
                 } else {
                     text.as_str()
                 };
-                let mut span = span(value).size(POST_FONT_SIZE);
-                if style.bold {
-                    span = span.font(Font {
-                        weight: iced::font::Weight::Bold,
-                        ..Font::DEFAULT
-                    });
-                }
-                if style.monospace {
-                    span = span.font(Font::MONOSPACE);
-                }
-                if style.underline {
-                    span = span.underline(true);
-                }
-                if style.strike {
-                    span = span.strikethrough(true);
-                }
-                if hidden {
-                    span = span
-                        .color(colors::MUTED)
-                        .background(Color::from_rgb8(0x3e, 0x3e, 0x3e));
-                    if let Some(spoiler) = spoiler {
-                        span = span.link(LinkAction::Spoiler(key.clone(), *spoiler));
+                for (part, emoji) in emoji_segments(value) {
+                    let mut part_span = span(part).size(POST_FONT_SIZE);
+                    if emoji {
+                        // General text fonts can contain a monochrome symbol
+                        // or the letters of a flag without its emoji glyph.
+                        part_span = part_span.font(emoji_font());
+                    } else {
+                        if style.bold {
+                            part_span = part_span.font(Font {
+                                weight: iced::font::Weight::Bold,
+                                ..Font::DEFAULT
+                            });
+                        }
+                        if style.monospace {
+                            part_span = part_span.font(Font::MONOSPACE);
+                        }
+                        if style.italic && !style.bold {
+                            part_span = part_span.font(Font {
+                                style: iced::font::Style::Italic,
+                                ..Font::DEFAULT
+                            });
+                        }
                     }
-                } else if style.italic && !style.bold {
-                    span = span.font(Font {
-                        style: iced::font::Style::Italic,
-                        ..Font::DEFAULT
-                    });
+                    if style.underline {
+                        part_span = part_span.underline(true);
+                    }
+                    if style.strike {
+                        part_span = part_span.strikethrough(true);
+                    }
+                    if hidden {
+                        part_span = part_span
+                            .color(colors::MUTED)
+                            .background(Color::from_rgb8(0x3e, 0x3e, 0x3e));
+                        if let Some(spoiler) = spoiler {
+                            part_span = part_span.link(LinkAction::Spoiler(key.clone(), *spoiler));
+                        }
+                    }
+                    spans.push(part_span);
                 }
-                spans.push(span);
             }
             Token::Link { href, label } => {
-                spans.push(
-                    span(label.as_str())
+                for (part, emoji) in emoji_segments(label) {
+                    let mut part_span = span(part)
                         .size(POST_FONT_SIZE)
                         .color(colors::LINK)
                         .underline(true)
-                        .link(LinkAction::Url(href.clone())),
-                );
+                        .link(LinkAction::Url(href.clone()));
+                    if emoji {
+                        part_span = part_span.font(emoji_font());
+                    }
+                    spans.push(part_span);
+                }
             }
             Token::Totoz { name } => {
-                spans.push(
-                    span(name.as_str())
-                        .size(POST_FONT_SIZE)
-                        .color(colors::TOTOZ)
-                        .font(Font {
+                for (part, emoji) in emoji_segments(name) {
+                    let font = if emoji {
+                        emoji_font()
+                    } else {
+                        Font {
                             weight: iced::font::Weight::Bold,
                             ..Font::DEFAULT
-                        })
-                        .link(LinkAction::Totoz(name.clone())),
-                );
+                        }
+                    };
+                    spans.push(
+                        span(part)
+                            .size(POST_FONT_SIZE)
+                            .color(colors::TOTOZ)
+                            .font(font)
+                            .link(LinkAction::Totoz(name.clone())),
+                    );
+                }
             }
             Token::Norloge {
                 reference_index,
@@ -676,23 +720,88 @@ fn message_spans<'a>(
                 spans.push(value);
             }
             Token::Bigorno { word } => {
-                spans.push(
-                    span(format!("{word}<"))
-                        .size(POST_FONT_SIZE)
-                        .color(colors::BIGORNO)
-                        .background(Color {
-                            a: 0.18,
-                            ..colors::BIGORNO
-                        })
-                        .font(Font {
+                let label = format!("{word}<");
+                for (part, emoji) in emoji_segments(&label) {
+                    let font = if emoji {
+                        emoji_font()
+                    } else {
+                        Font {
                             weight: iced::font::Weight::Bold,
                             ..Font::DEFAULT
-                        }),
-                );
+                        }
+                    };
+                    spans.push(
+                        span(part.to_owned())
+                            .size(POST_FONT_SIZE)
+                            .color(colors::BIGORNO)
+                            .background(Color {
+                                a: 0.18,
+                                ..colors::BIGORNO
+                            })
+                            .font(font),
+                    );
+                }
             }
         }
     }
     spans
+}
+
+fn emoji_segments(value: &str) -> Vec<(&str, bool)> {
+    fn is_emoji(grapheme: &str) -> bool {
+        if grapheme.contains('\u{fe0e}') {
+            return false;
+        }
+        grapheme.contains('\u{fe0f}')
+            || grapheme.chars().any(|character| {
+                matches!(
+                    character.emoji_status(),
+                    EmojiStatus::EmojiPresentation
+                        | EmojiStatus::EmojiPresentationAndModifierBase
+                        | EmojiStatus::EmojiPresentationAndEmojiComponent
+                        | EmojiStatus::EmojiPresentationAndModifierAndEmojiComponent
+                )
+            })
+    }
+
+    if value.is_ascii() || !value.graphemes(true).any(is_emoji) {
+        return vec![(value, false)];
+    }
+    let mut result = Vec::new();
+    let mut start = 0;
+    let mut current = false;
+    for (index, grapheme) in value.grapheme_indices(true) {
+        let emoji = is_emoji(grapheme);
+        if emoji != current {
+            if start < index {
+                result.push((&value[start..index], current));
+            }
+            start = index;
+            current = emoji;
+        }
+    }
+    if start < value.len() {
+        result.push((&value[start..], current));
+    }
+    result
+}
+
+fn emoji_font() -> Font {
+    Font::with_name("Noto Color Emoji")
+}
+
+fn emoji_rich<'a>(value: impl AsRef<str>) -> iced::widget::text::Rich<'a, (), Message> {
+    let spans: Vec<Span<'a, ()>> = emoji_segments(value.as_ref())
+        .into_iter()
+        .map(|(part, emoji)| {
+            let mut part_span = span(part.to_owned());
+            if emoji {
+                part_span = part_span.font(emoji_font());
+            }
+            part_span
+        })
+        .collect();
+    iced::widget::text::Rich::with_spans(spans)
 }
 
 fn composer(app: &App) -> Element<'_, Message> {
@@ -726,8 +835,8 @@ fn composer(app: &App) -> Element<'_, Message> {
 
     let toolbar = row![
         Space::new().width(Fill),
-        icon_button("🔍", Message::OpenTotoz),
-        icon_button("⚙", Message::OpenSettings),
+        icon_button("🔍", Message::OpenTotoz, 4.0),
+        icon_button("⚙", Message::OpenSettings, 0.0),
     ]
     .spacing(4)
     .align_y(Alignment::Center)
@@ -812,29 +921,33 @@ fn totoz_suggestion_label<'a>(name: &str, query: &str) -> Element<'a, Message> {
         .filter(|split| name.is_char_boundary(*split))
         .unwrap_or(0);
     let (typed, predicted) = name.split_at(split);
-    let font = Font {
+    let predicted_font = Font {
         weight: iced::font::Weight::Bold,
         ..Font::DEFAULT
     };
-    let mut spans = vec![span(format!("[:{typed}")).size(13).color(colors::TOTOZ)];
-    if predicted.is_empty() {
-        spans.push(span("]").size(13).color(colors::TOTOZ));
-    } else {
-        spans.push(
-            span(format!("{predicted}]"))
-                .size(13)
-                .color(colors::TOTOZ)
-                .font(font),
-        );
+    let mut spans = Vec::new();
+    for (label, font) in [
+        (format!("[:{typed}"), Font::DEFAULT),
+        (format!("{predicted}]"), predicted_font),
+    ] {
+        for (part, emoji) in emoji_segments(&label) {
+            spans.push(
+                span(part.to_owned())
+                    .size(13)
+                    .color(colors::TOTOZ)
+                    .font(if emoji { emoji_font() } else { font }),
+            );
+        }
     }
     iced::widget::text::Rich::<'_, (), Message, _>::with_spans(spans).into()
 }
 
-fn icon_button<'a>(glyph: &'a str, message: Message) -> Element<'a, Message> {
+fn icon_button<'a>(glyph: &'a str, message: Message, top_padding: f32) -> Element<'a, Message> {
     button(
         container(text(glyph).size(16).style(colors::muted_text))
             .width(Fill)
             .height(Fill)
+            .padding(iced::Padding::ZERO.top(top_padding))
             .center_x(Fill)
             .center_y(Fill),
     )
@@ -911,10 +1024,8 @@ fn settings_view(app: &App) -> Element<'_, Message> {
                     Message::Settings(SettingsMessage::ToggleBoard(name.clone()))
                 })
                 .size(16),
-            text(board.name.clone())
-                .size(14)
-                .width(Length::Fixed(130.0)),
-            text(board.backend_url.clone())
+            emoji_rich(&board.name).size(14).width(Length::Fixed(130.0)),
+            emoji_rich(&board.backend_url)
                 .size(10)
                 .style(colors::muted_text)
                 .width(Fill),
@@ -1071,7 +1182,7 @@ fn settings_view(app: &App) -> Element<'_, Message> {
         )
         .size(10)
         .style(colors::muted_text),
-        text(match app.config.linuxfr.as_ref() {
+        emoji_rich(match app.config.linuxfr.as_ref() {
             Some(session) if !session.access_token.is_empty() => {
                 format!(
                     "Connecté{}",
@@ -1100,13 +1211,21 @@ fn settings_view(app: &App) -> Element<'_, Message> {
                 let visible = !draft.hidden_tribunes.contains(&key_string);
                 let label = format!("{} / {}", server.name, name);
                 tribune_count += 1;
+                let label_key = key_string.clone();
                 tribune_list = tribune_list.push(
-                    checkbox(visible)
-                        .label(label)
-                        .on_toggle(move |_| {
-                            Message::Settings(SettingsMessage::ToggleTribune(key_string.clone()))
-                        })
-                        .size(16),
+                    row![
+                        checkbox(visible)
+                            .on_toggle(move |_| {
+                                Message::Settings(SettingsMessage::ToggleTribune(
+                                    key_string.clone(),
+                                ))
+                            })
+                            .size(16),
+                        mouse_area(emoji_rich(label).size(16))
+                            .on_press(Message::Settings(SettingsMessage::ToggleTribune(label_key)))
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
                 );
             }
         }
@@ -1139,10 +1258,10 @@ fn settings_view(app: &App) -> Element<'_, Message> {
     .max_width(980);
 
     if let Some(error) = &draft.error {
-        page = page.push(text(error.clone()).style(colors::danger_text));
+        page = page.push(emoji_rich(error).style(colors::danger_text));
     }
     if let Some(info) = &draft.info {
-        page = page.push(text(info.clone()).style(colors::success_text));
+        page = page.push(emoji_rich(info).style(colors::success_text));
     }
 
     page = page
@@ -1267,7 +1386,7 @@ fn totoz_view(app: &App) -> Element<'_, Message> {
         results = results.push(text("Recherche…").style(colors::muted_text));
     }
     if let Some(error) = &app.totoz.error {
-        results = results.push(text(error.clone()).style(colors::danger_text));
+        results = results.push(emoji_rich(error).style(colors::danger_text));
     }
     for chunk in app.totoz.results.chunks(5) {
         let mut line = row![].spacing(8).width(Fill);
@@ -1294,7 +1413,7 @@ fn totoz_view(app: &App) -> Element<'_, Message> {
                 button(
                     column![
                         preview,
-                        text(totoz.name.clone())
+                        emoji_rich(&totoz.name)
                             .size(11)
                             .width(Length::Fixed(96.0))
                             .wrapping(iced::widget::text::Wrapping::Word),
@@ -1330,7 +1449,7 @@ fn totoz_view(app: &App) -> Element<'_, Message> {
             .size(12)
             .style(colors::muted_text),
         Space::new().width(Fill),
-        text(format!("serveur : {}", app.config.totoz_server))
+        emoji_rich(format!("serveur : {}", app.config.totoz_server))
             .size(11)
             .style(colors::muted_text),
     ]
@@ -1378,8 +1497,8 @@ fn emoji_view(app: &App) -> Element<'_, Message> {
         grid_items.push(
             button(
                 column![
-                    text(emoji.characters.clone()).size(28),
-                    text(emoji.name.clone())
+                    emoji_rich(&emoji.characters).size(28),
+                    emoji_rich(&emoji.name)
                         .size(9)
                         .width(Length::Fixed(84.0))
                         .wrapping(iced::widget::text::Wrapping::Word)
@@ -1463,6 +1582,23 @@ mod tests {
 
     type Paragraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
 
+    #[test]
+    fn uses_emoji_font_for_complete_emoji_sequences() {
+        assert_eq!(
+            emoji_segments("Météo pour Montpellier 🇫🇷 : Ensoleillé ⚽"),
+            vec![
+                ("Météo pour Montpellier ", false),
+                ("🇫🇷", true),
+                (" : Ensoleillé ", false),
+                ("⚽", true),
+            ]
+        );
+        assert_eq!(emoji_segments("🇫🇷🇧🇪"), vec![("🇫🇷🇧🇪", true)]);
+        assert_eq!(
+            emoji_segments("été ☀️ ok"),
+            vec![("été ", false), ("☀️", true), (" ok", false)]
+        );
+    }
     /// Mirror the composer structure: toolbar, suggestion slot, entry field.
     fn composer_with_suggestions(
         suggestions: Option<Element<'static, ()>>,

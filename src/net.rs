@@ -13,6 +13,7 @@ use quick_xml::events::Event as XmlEvent;
 use quick_xml::Reader;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::config::{Board, LinuxfrSession};
 use crate::model::Post;
@@ -452,9 +453,9 @@ fn html_title(html: &str) -> Option<String> {
     if title.is_empty() {
         return None;
     }
-    let mut characters = title.chars();
-    let shortened: String = characters.by_ref().take(MAX_LINK_TITLE_CHARS).collect();
-    Some(if characters.next().is_some() {
+    let mut graphemes = title.graphemes(true);
+    let shortened: String = graphemes.by_ref().take(MAX_LINK_TITLE_CHARS).collect();
+    Some(if graphemes.next().is_some() {
         format!("{shortened}…")
     } else {
         shortened

@@ -48,14 +48,7 @@ pub fn parse_tsv(body: &str, tribune: &str) -> Vec<Post> {
             posts.push(post);
         }
     }
-    // Boards return posts oldest first. If an id is repeated, the last
-    // occurrence wins, as in gb2c.
-    posts.sort_by_key(|post| post.id);
-    posts.dedup_by_key(|post| post.id);
-    if posts.len() > MAX_POSTS {
-        posts.drain(..posts.len() - MAX_POSTS);
-    }
-    posts
+    finish_posts(posts)
 }
 
 fn parse_tsv_line(line: &str, tribune: &str) -> Option<Post> {
@@ -185,6 +178,12 @@ pub fn parse_xml(body: &str, tribune: &str) -> Vec<Post> {
         }
     }
 
+    finish_posts(posts)
+}
+
+/// Keep the last occurrence of each id, then retain the newest posts.
+fn finish_posts(mut posts: Vec<Post>) -> Vec<Post> {
+    posts.reverse();
     posts.sort_by_key(|post| post.id);
     posts.dedup_by_key(|post| post.id);
     if posts.len() > MAX_POSTS {
@@ -215,7 +214,7 @@ struct XmlPost {
 
 impl XmlPost {
     fn finish(self, tribune: &str) -> Option<Post> {
-        let id = self.id?.abs();
+        let id = self.id?.checked_abs()?;
         if id <= 0 {
             return None;
         }
@@ -298,5 +297,20 @@ mod tests {
         let posts = parse_backend(body.as_bytes(), "x");
         assert_eq!(posts.len(), 1);
         assert_eq!(posts[0].message, "Hello <b>world</b>");
+    }
+
+    #[test]
+    fn duplicate_ids_keep_the_last_row_in_both_formats() {
+        let tsv = "7\t20240629134501\tdave\t\told\n7\t20240629134501\tdave\t\tnew\n";
+        assert_eq!(parse_tsv(tsv, "x")[0].message, "new");
+
+        let xml = "<board><post id=\"7\" time=\"20240629134501\"><message>old</message></post><post id=\"7\" time=\"20240629134501\"><message>new</message></post></board>";
+        assert_eq!(parse_xml(xml, "x")[0].message, "new");
+    }
+
+    #[test]
+    fn xml_minimum_integer_id_is_ignored_without_panicking() {
+        let xml = "<board><post id=\"-9223372036854775808\" time=\"20240629134501\"><message>bad</message></post></board>";
+        assert!(parse_xml(xml, "x").is_empty());
     }
 }

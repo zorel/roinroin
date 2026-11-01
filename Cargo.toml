@@ -45,6 +45,8 @@ url = "2"
 directories = "6"
 open = "5"
 bytes = "1"
+unicode-properties = { version = "0.1", default-features = false, features = ["emoji"] }
+unicode-segmentation = "1"
 
 [profile.release]
 lto = "thin"
