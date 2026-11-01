@@ -158,7 +158,7 @@ impl App {
                             if self.active.is_some() && self.screen == Screen::Main {
                                 // The entry zone just appeared: put the caret
                                 // in it as on startup.
-                                tasks.push(focus_text_input(&self.composer_id));
+                                tasks.push(self.focus_composer());
                             }
                         }
                     }
@@ -299,7 +299,7 @@ impl App {
                         }
                     }
                     self.active = Some(key);
-                    tasks.push(focus_text_input(&self.composer_id));
+                    tasks.push(self.focus_composer());
                     self.selected = None;
                     self.hovered_post = None;
                     self.hovered_link_post = None;
@@ -405,8 +405,14 @@ impl App {
             }
             Message::Composer(value) => {
                 self.composer = auto_close_formatting_tag(&self.composer, &value).unwrap_or(value);
+                self.composer_caret = self
+                    .composer_caret
+                    .min(self.composer.graphemes(true).count());
                 self.draft_dirty = true;
                 tasks.extend(self.refresh_totoz_suggest());
+            }
+            Message::ComposerCaret(caret) => {
+                self.composer_caret = caret.min(self.composer.graphemes(true).count());
             }
             Message::ComposerSubmit => {
                 if self.totoz_suggest.visible() {
@@ -682,7 +688,7 @@ impl App {
                 self.hovered_link_preview = None;
                 self.hovered_preview = None;
                 self.scroll_to_bottom = true;
-                tasks.push(focus_text_input(&self.composer_id));
+                tasks.push(self.focus_composer());
                 tasks.push(iced::widget::operation::snap_to_end(
                     self.posts_scroll_id.clone(),
                 ));

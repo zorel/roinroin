@@ -17,6 +17,7 @@ use futures::StreamExt;
 use iced::keyboard;
 use iced::widget::{image, Id};
 use iced::{mouse, window, Point, Size, Subscription, Task, Theme};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::config::{
     self, BlockedMode, Board, BoardAuth, Config, Language, LinuxfrSession, NotifyConfig,
@@ -339,6 +340,7 @@ pub enum Message {
     MarkAllRead,
     Scrolled(f32),
     Composer(String),
+    ComposerCaret(usize),
     ComposerSubmit,
     Insert(String),
     TotozPicked(String),
@@ -419,6 +421,7 @@ pub struct App {
     pub(crate) sidebar_dragging: bool,
     pub(crate) scroll_offset: f32,
     pub(crate) composer: String,
+    pub(crate) composer_caret: usize,
     pub(crate) totoz_suggest: TotozSuggest,
     pub(crate) draft_dirty: bool,
     pub(crate) state_dirty: bool,
@@ -469,6 +472,7 @@ impl App {
         let now = Utc::now().with_timezone(&Paris);
         let mut app = Self {
             composer: config.draft.clone(),
+            composer_caret: config.draft.graphemes(true).count(),
             totoz_suggest: TotozSuggest::default(),
             settings: SettingsDraft::from_config(&config),
             config,
@@ -544,7 +548,7 @@ impl App {
         let mut tasks = app.refresh_tasks();
         if app.active.is_some() {
             // Start with the caret in the entry zone, ready to type.
-            tasks.push(focus_text_input(&app.composer_id));
+            tasks.push(app.focus_composer());
         }
         let width = app.persisted.window_width;
         let height = app.persisted.window_height;
@@ -1179,6 +1183,14 @@ fn build_sse(config: &net::SseConfig) -> impl futures::Stream<Item = Message> {
 fn focus_text_input(id: &Id) -> Task<Message> {
     iced::widget::operation::focus(id.clone())
         .chain(iced::widget::operation::move_cursor_to_end(id.clone()))
+}
+
+/// Focus a text input and place the caret at a specific grapheme index.
+fn focus_text_input_at(id: &Id, position: usize) -> Task<Message> {
+    iced::widget::operation::focus(id.clone()).chain(iced::widget::operation::move_cursor_to(
+        id.clone(),
+        position,
+    ))
 }
 
 /// Keep only names containing `query`, with prefix matches first, then the

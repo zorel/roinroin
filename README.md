@@ -84,13 +84,14 @@ et reprend les fonctions des clients existants `gb3tui`, `gb3-android` et
 - fermeture automatique des balises : taper `<b>`, `<i>`, `<u>`, `<s>`,
   `<tt>`, `<code>` ou `<spoiler>` insère aussitôt la balise fermante et laisse
   le curseur entre les deux ;
-- citation d'un post au clic sur son horloge, avec bascule automatique du
-  suffixe `@tribune` quand on change de tribune ;
+- citation d'un post au clic sur son horloge, insérée à la position du
+  curseur, avec bascule automatique du suffixe `@tribune` quand on change de
+  tribune ;
 - envoi par bouton, `Entrée` ou `Ctrl+Entrée`, restauration du brouillon si
   l'envoi échoue ;
-- insertion des totoz et emojis dans le brouillon ; choisir un totoz dans la
-  recherche revient à la tribune, l'insère avec un espace et place le curseur
-  juste après ;
+- insertion des totoz et emojis dans le brouillon à la position du curseur ;
+  choisir un totoz dans la recherche revient à la tribune, l'insère avec un
+  espace et place le curseur juste après ;
 - autocomplétion des totoz directement dans l'éditeur : dès `[:` suivi de deux
   caractères, les totoz correspondants s'affichent juste au-dessus du champ
   avec un aperçu miniature (aucune liste s'il n'y a pas de correspondance) ;

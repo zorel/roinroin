@@ -1105,14 +1105,18 @@ fn composer(app: &App) -> Element<'_, Message> {
         None => "écrire un message…".to_owned(),
     };
 
-    let editor = text_input(&hint, &app.composer)
-        .id(app.composer_id.clone())
-        .on_input(Message::Composer)
-        .on_submit(Message::ComposerSubmit)
-        .size(14)
-        .padding([8, 10])
-        .width(Fill)
-        .style(colors::text_input_style);
+    let editor = crate::composer_input::ComposerInput::new(
+        text_input(&hint, &app.composer)
+            .id(app.composer_id.clone())
+            .on_input(Message::Composer)
+            .on_submit(Message::ComposerSubmit)
+            .size(14)
+            .padding([8, 10])
+            .width(Fill)
+            .style(colors::text_input_style),
+        app.composer_caret,
+        Message::ComposerCaret,
+    );
 
     let send = button(container(text("Envoyer").size(14)).center_y(Fill))
         .on_press(Message::Send)

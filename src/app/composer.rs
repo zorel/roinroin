@@ -1,15 +1,25 @@
 //! Composer behavior for the application.
 
+use unicode_segmentation::UnicodeSegmentation;
+
 use super::*;
 
 impl App {
-    /// Append text to the composer and place the caret right after it, so the
-    /// user can keep typing without reaching for the entry field.
+    /// Place the caret at the end of the draft and focus the entry field.
+    pub(super) fn focus_composer(&mut self) -> Task<Message> {
+        self.composer_caret = self.composer.graphemes(true).count();
+        focus_text_input(&self.composer_id)
+    }
+
+    /// Insert text at the caret and place the caret right after it, so clock
+    /// quotes, totoz and emoji insertions land where the user is typing.
     pub(super) fn insert_composer(&mut self, text: &str) -> Task<Message> {
-        self.composer.push_str(text);
+        let (composer, caret) = insert_at_grapheme(&self.composer, self.composer_caret, text);
+        self.composer = composer;
+        self.composer_caret = caret;
         self.draft_dirty = true;
         self.totoz_suggest.clear();
-        focus_text_input(&self.composer_id)
+        focus_text_input_at(&self.composer_id, self.composer_caret)
     }
 
     /// Detect the unfinished `[:…` token at the end of the composer and start
@@ -129,6 +139,52 @@ impl App {
         self.composer.push_str(&format!("[:{name}] "));
         self.draft_dirty = true;
         self.totoz_suggest.clear();
-        vec![focus_text_input(&self.composer_id)]
+        vec![self.focus_composer()]
+    }
+}
+
+/// Insert `insertion` at the given grapheme index and return the new text
+/// together with the caret placed right after the inserted part.
+fn insert_at_grapheme(text: &str, caret: usize, insertion: &str) -> (String, usize) {
+    let caret = caret.min(text.graphemes(true).count());
+    let byte = text
+        .grapheme_indices(true)
+        .nth(caret)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len());
+    let mut result = String::with_capacity(text.len() + insertion.len());
+    result.push_str(&text[..byte]);
+    result.push_str(insertion);
+    result.push_str(&text[byte..]);
+    (result, caret + insertion.graphemes(true).count())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inserts_at_the_caret_instead_of_the_end() {
+        assert_eq!(
+            insert_at_grapheme("hello world", 5, " there"),
+            ("hello there world".to_owned(), 11)
+        );
+        assert_eq!(
+            insert_at_grapheme("hello", 0, "> "),
+            ("> hello".to_owned(), 2)
+        );
+    }
+
+    #[test]
+    fn insertion_respects_grapheme_boundaries() {
+        let (text, caret) = insert_at_grapheme("a🇫🇷b", 2, "12:34:56 ");
+        // The flag is one grapheme but several bytes.
+        assert_eq!(text, "a🇫🇷12:34:56 b");
+        assert_eq!(caret, 11);
+    }
+
+    #[test]
+    fn caret_is_clamped_to_the_draft() {
+        assert_eq!(insert_at_grapheme("hi", 99, "!"), ("hi!".to_owned(), 3));
     }
 }

@@ -4,6 +4,7 @@
 //! server (HTTP/SSE) and directly to bouchot boards (TSV/XML + form POST).
 
 mod app;
+mod composer_input;
 mod config;
 mod conversation;
 mod hover_text;
