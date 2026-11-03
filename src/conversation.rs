@@ -196,7 +196,10 @@ pub fn analyze(
             // draw reply edges. gc2 only groups by full clocks.
             let authoritative = matches!(
                 reference.kind,
-                NorlogeKind::FullDateTime(_) | NorlogeKind::Clock(_) | NorlogeKind::Id(_)
+                NorlogeKind::FullDateTime(_)
+                    | NorlogeKind::DateClock { .. }
+                    | NorlogeKind::Clock(_)
+                    | NorlogeKind::Id(_)
             );
             if !authoritative {
                 continue;
@@ -744,6 +747,29 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(analysis.posts[&b].refs[0].target, Some(a));
+    }
+
+    #[test]
+    fn date_clock_references_build_conversation_edges() {
+        let mut posts = BTreeMap::new();
+        let (parent, parent_post) = post("t", 1, "20241102231101", "dave", "hello");
+        let (reply, reply_post) = post("t", 2, "20241102231200", "bob", "11/02#23:11:01 merci");
+        posts.insert(parent.clone(), parent_post);
+        posts.insert(reply.clone(), reply_post);
+        let analysis = analyze(
+            &posts,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            chrono::NaiveDate::from_ymd_opt(2024, 11, 2)
+                .unwrap()
+                .and_hms_opt(23, 15, 0)
+                .unwrap(),
+        );
+        assert_eq!(analysis.posts[&reply].refs[0].target, Some(parent.clone()));
+        assert!(analysis.posts[&reply].parents.contains(&parent));
+        assert_eq!(analysis.posts[&reply].root, Some(parent.clone()));
+        assert_eq!(analysis.conversation_root(&reply), parent);
+        assert_eq!(analysis.conversation(&reply), vec![parent, reply]);
     }
 }
 

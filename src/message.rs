@@ -898,6 +898,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_long_date_clock_references() {
+        let parsed = parse("11/02#23:11:01 merci");
+        assert_eq!(parsed.norloges.len(), 1);
+        assert_eq!(parsed.norloges[0].raw, "11/02#23:11:01");
+        assert_eq!(
+            parsed.norloges[0].kind,
+            NorlogeKind::DateClock {
+                month: 11,
+                day: 2,
+                clock: NaiveTime::from_hms_opt(23, 11, 1).unwrap(),
+            }
+        );
+    }
+
+    #[test]
     fn parses_iso_and_indices() {
         let parsed = parse("2017-06-29T13:45:01.421^2@dlfp");
         assert_eq!(parsed.norloges.len(), 1);
