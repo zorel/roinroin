@@ -875,8 +875,6 @@ impl Widget<Message, Theme, Renderer> for HoverRich<'_> {
         let state = _tree.state.downcast_ref::<State>();
         if state.hovered_link.is_some() {
             mouse::Interaction::Pointer
-        } else if self.order.is_some() {
-            mouse::Interaction::Text
         } else {
             mouse::Interaction::None
         }

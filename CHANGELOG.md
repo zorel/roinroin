@@ -29,6 +29,8 @@
 
 - le curseur du champ de composition ne saute plus à la fin du texte indicatif
   quand le brouillon est vide ;
+- le curseur reste la flèche du système au-dessus des posts ; le curseur texte
+  est réservé au champ de composition ;
 - la sélection de texte est correctement effacée au changement de tribune,
   d'écran ou lors d'un clic ailleurs.
 
