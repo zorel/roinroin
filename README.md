@@ -16,6 +16,8 @@ Le client suit le [standard tribune / bouchot](https://rfm.devnewton.fr/standard
 et reprend les fonctions des clients existants `gb3tui`, `gb3-android` et
 `wmcoincoin`, avec une intégration Linux soignée.
 
+![Aperçu de roinroin](screenshot.png)
+
 ## Aperçu des fonctions
 
 ### Sources et réseau
@@ -73,6 +75,10 @@ et reprend les fonctions des clients existants `gb3tui`, `gb3-android` et
 - listes **plop** : les messages des auteurs choisis sont remplacés par
   `pika`, `plop`, `prout`, `grouik` ou `meuh` ;
 - compteurs de non-lus et badges bigorno/réponse dans le panneau des tribunes ;
+- sélection du texte des posts à la souris dans le panneau principal, avec
+  surlignage et copie par `Ctrl+C` ; la sélection peut traverser plusieurs
+  posts ; un lien sélectionné (ou cliqué à droite) est copié avec son URL
+  complète plutôt qu'avec son libellé ;
 - cloche horaire optionnelle (`hourly_bell`).
 
 ### Écriture
@@ -149,8 +155,15 @@ Options utiles :
 ```bash
 roinroin --gb2c http://localhost:16666 --nickname dave
 roinroin --no-notifications
+roinroin --debug-http
+roinroin --profile
 roinroin --help
 ```
+
+`--profile` (ou `ROINROIN_PROFILE=1`) affiche sur stderr, toutes les cinq
+secondes, le nombre et le coût des mises à jour, des rendus et des analyses de
+conversations. Les opérations anormalement lentes sont aussi journalisées, ce
+qui permet d'identifier un pic CPU sans profiler externe.
 
 Ou :
 
@@ -241,6 +254,7 @@ d'accès brut ; le rafraîchissement se fait ensuite via
 | `Ctrl+R` / `F5` | tout actualiser |
 | `Ctrl+,` | réglages |
 | `Ctrl+M` | tout marquer comme lu |
+| `Ctrl+C` | copier le texte sélectionné dans la tribune |
 | `Ctrl+T` / `Ctrl+E` | ToToz / Emoji |
 | `Échap` | fermer un panneau ou désélectionner |
 
@@ -258,6 +272,7 @@ src/
   message.rs       scanner BML, norloges, bigornos, totoz
   conversation.rs  résolution des références, graphe, filtres, statistiques
   model.rs         clés de source/tribune/post, temps, identités
+  selection.rs     positions et plage de sélection de texte
   config.rs        configuration TOML, état JSON, boards prédéfinis
   notify.rs        notifications D-Bus
   theme.rs         palette et styles iced

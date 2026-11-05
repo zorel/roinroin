@@ -6,7 +6,6 @@
 
 use iced::advanced::layout;
 use iced::advanced::text;
-use iced::advanced::widget::operation::TextInput as _;
 use iced::advanced::widget::tree::{self, Tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget};
 use iced::keyboard;
@@ -21,6 +20,10 @@ where
     Renderer: text::Renderer,
 {
     content: Element<'a, Message, Theme, Renderer>,
+    /// The actual input value. `text_input::State::text()` falls back to the
+    /// placeholder when the field is empty, which would make the caret look
+    /// like it sits at the end of the hint.
+    value: &'a str,
     cursor: usize,
     selection: Option<(usize, usize)>,
     on_cursor: CursorCallback<'a, Message>,
@@ -33,6 +36,7 @@ where
 {
     pub fn new(
         content: impl Into<Element<'a, Message, Theme, Renderer>>,
+        value: &'a str,
         cursor: usize,
         selection: Option<(usize, usize)>,
         on_cursor: impl Fn(usize, Option<(usize, usize)>) -> Message + 'a,
@@ -40,6 +44,7 @@ where
     ) -> Self {
         Self {
             content: content.into(),
+            value,
             cursor,
             selection,
             on_cursor: Box::new(on_cursor),
@@ -135,7 +140,7 @@ where
         if !input.is_focused() {
             return;
         }
-        let value = Value::new(input.text());
+        let value = Value::new(self.value);
         let (caret, selection) = match input.cursor().state(&value) {
             cursor::State::Index(index) => (index, None),
             cursor::State::Selection { start, end } => {

@@ -8,6 +8,7 @@ mod settings;
 mod sources;
 mod update;
 
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,7 @@ use crate::message::{self, ParsedMessage, Token};
 use crate::model::{compare_posts, quote_clock, Post, PostKey, SourceId, TribuneKey};
 use crate::net;
 use crate::notify;
+use crate::selection::{TextPosition, TextSelection};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkAction {
@@ -331,6 +333,12 @@ pub enum Message {
     SelectTribune(TribuneKey),
     PostClicked(PostKey),
     PostRightClicked(PostKey),
+    TextSelectionStart(TextPosition),
+    TextSelectionUpdate(TextPosition),
+    TextSelectionEnd,
+    TextSelectionClear,
+    CopyTextSelection,
+    CopySelection(String),
     ConversationScrolled(PostKey, bool),
     CloseConversation(PostKey),
     ClearSelection,
@@ -371,6 +379,7 @@ pub enum Message {
     CloseScreen,
     Spoiler(PostKey, usize),
     LinkClicked(LinkAction),
+    LinkRightClicked(LinkAction),
     OpenUrl(String),
     HoverPost(Option<PostKey>),
     HoverExit,
@@ -390,6 +399,144 @@ pub enum Message {
     Noop,
 }
 
+impl Message {
+    /// Short, allocation-free name used by the profiler.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Tick => "Tick",
+            Self::WindowEvent(..) => "WindowEvent",
+            Self::Keyboard(_) => "Keyboard",
+            Self::ModifiersChanged(_) => "ModifiersChanged",
+            Self::ServerInfo(..) => "ServerInfo",
+            Self::BoardPosts(..) => "BoardPosts",
+            Self::Sse(..) => "Sse",
+            Self::SelectTribune(_) => "SelectTribune",
+            Self::PostClicked(_) => "PostClicked",
+            Self::PostRightClicked(_) => "PostRightClicked",
+            Self::TextSelectionStart(_) => "TextSelectionStart",
+            Self::TextSelectionUpdate(_) => "TextSelectionUpdate",
+            Self::TextSelectionEnd => "TextSelectionEnd",
+            Self::TextSelectionClear => "TextSelectionClear",
+            Self::CopyTextSelection => "CopyTextSelection",
+            Self::CopySelection(_) => "CopySelection",
+            Self::ConversationScrolled(..) => "ConversationScrolled",
+            Self::CloseConversation(_) => "CloseConversation",
+            Self::ClearSelection => "ClearSelection",
+            Self::JumpTo(_) => "JumpTo",
+            Self::ToggleBlockedMode => "ToggleBlockedMode",
+            Self::ToggleShowHidden => "ToggleShowHidden",
+            Self::MarkAllRead => "MarkAllRead",
+            Self::Scrolled(_) => "Scrolled",
+            Self::Composer(_) => "Composer",
+            Self::ComposerCursor(..) => "ComposerCursor",
+            Self::ComposerSubmit => "ComposerSubmit",
+            Self::Insert(_) => "Insert",
+            Self::TotozPicked(_) => "TotozPicked",
+            Self::TotozSuggestSearch(_) => "TotozSuggestSearch",
+            Self::TotozSuggestLoaded(..) => "TotozSuggestLoaded",
+            Self::TotozSuggestImage(..) => "TotozSuggestImage",
+            Self::TotozSuggestPick(_) => "TotozSuggestPick",
+            Self::TotozSuggestDismiss => "TotozSuggestDismiss",
+            Self::Send => "Send",
+            Self::FlushSse => "FlushSse",
+            Self::CursorMoved(_) => "CursorMoved",
+            Self::SidebarDragStart => "SidebarDragStart",
+            Self::SidebarDragEnd => "SidebarDragEnd",
+            Self::Posted(..) => "Posted",
+            Self::RefreshAll => "RefreshAll",
+            Self::PollBoards => "PollBoards",
+            Self::TotozQuery(_) => "TotozQuery",
+            Self::TotozSearch => "TotozSearch",
+            Self::TotozLoaded(_) => "TotozLoaded",
+            Self::TotozImages(_) => "TotozImages",
+            Self::EmojiQuery(_) => "EmojiQuery",
+            Self::EmojiSearch => "EmojiSearch",
+            Self::EmojiLoaded(_) => "EmojiLoaded",
+            Self::Settings(_) => "Settings",
+            Self::OpenSettings => "OpenSettings",
+            Self::OpenTotoz => "OpenTotoz",
+            Self::OpenEmoji => "OpenEmoji",
+            Self::CloseScreen => "CloseScreen",
+            Self::Spoiler(..) => "Spoiler",
+            Self::LinkClicked(_) => "LinkClicked",
+            Self::LinkRightClicked(_) => "LinkRightClicked",
+            Self::OpenUrl(_) => "OpenUrl",
+            Self::HoverPost(_) => "HoverPost",
+            Self::HoverExit => "HoverExit",
+            Self::HoverLink(..) => "HoverLink",
+            Self::PreviewEnter => "PreviewEnter",
+            Self::PreviewExit => "PreviewExit",
+            Self::HidePreview(_) => "HidePreview",
+            Self::PostShown(_) => "PostShown",
+            Self::PostHidden(_) => "PostHidden",
+            Self::TotozHoverImage(..) => "TotozHoverImage",
+            Self::LinkFetched(..) => "LinkFetched",
+            Self::TotozFrameTick => "TotozFrameTick",
+            Self::LinuxfrRefreshed(_) => "LinuxfrRefreshed",
+            Self::RefreshLinuxfr => "RefreshLinuxfr",
+            Self::Info(_) => "Info",
+            Self::Error(_) => "Error",
+            Self::Noop => "Noop",
+        }
+    }
+}
+
+/// Collects the selected text of every timeline paragraph, in document order.
+#[derive(Default)]
+struct CollectSelection {
+    parts: Vec<(u64, String)>,
+}
+
+impl CollectSelection {
+    fn joined(mut self) -> String {
+        self.parts.sort_by_key(|(order, _)| *order);
+
+        let mut text = String::new();
+        let mut previous = None;
+
+        for (order, part) in self.parts {
+            if !text.is_empty() {
+                // An identity and its message share the same post and are
+                // joined with a space; moving to the next post starts a line.
+                if previous.is_some_and(|previous| order == previous + 1 && order % 2 == 1) {
+                    text.push(' ');
+                } else {
+                    text.push('\n');
+                }
+            }
+
+            text.push_str(&part);
+            previous = Some(order);
+        }
+
+        text
+    }
+}
+
+impl iced::advanced::widget::Operation<String> for CollectSelection {
+    fn traverse(
+        &mut self,
+        operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<String>),
+    ) {
+        operate(self);
+    }
+
+    fn custom(&mut self, _id: Option<&Id>, _bounds: iced::Rectangle, state: &mut dyn Any) {
+        if let Some((order, text)) = crate::hover_text::selection_from_state(state) {
+            self.parts.push((order, text.to_owned()));
+        }
+    }
+
+    fn finish(&self) -> iced::advanced::widget::operation::Outcome<String> {
+        iced::advanced::widget::operation::Outcome::Some(
+            CollectSelection {
+                parts: self.parts.clone(),
+            }
+            .joined(),
+        )
+    }
+}
+
 pub struct App {
     pub(crate) config: Config,
     pub(crate) persisted: PersistedState,
@@ -401,6 +548,7 @@ pub struct App {
     pub(crate) analysis_dirty: bool,
     pub(crate) active: Option<TribuneKey>,
     pub(crate) selected: Option<PostKey>,
+    pub(crate) text_selection: Option<TextSelection>,
     pub(crate) conversations: Vec<ConversationPane>,
     pub(crate) conversations_dirty: bool,
     pub(crate) shift_held: bool,
@@ -487,6 +635,7 @@ impl App {
             analysis_dirty: true,
             active: None,
             selected: None,
+            text_selection: None,
             conversations: Vec::new(),
             conversations_dirty: false,
             shift_held: false,
@@ -599,6 +748,44 @@ impl App {
                     }
                     iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                         Some(Message::SidebarDragEnd)
+                    }
+                    _ => None,
+                },
+            ));
+        }
+        // The composer input can consume Ctrl+C even when the user has just
+        // selected timeline text, so watch the raw event while a selection is
+        // active instead of relying on `keyboard::listen`.
+        if self.screen == Screen::Main && self.text_selection.is_some() {
+            subscriptions.push(iced::event::listen_with(
+                |event, _status, _window| match event {
+                    iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Character(character),
+                        modifiers,
+                        ..
+                    }) if modifiers.control() && character.eq_ignore_ascii_case("c") => {
+                        Some(Message::CopyTextSelection)
+                    }
+                    iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                        ..
+                    }) => Some(Message::TextSelectionClear),
+                    _ => None,
+                },
+            ));
+        }
+        // A click outside the timeline ends the current text selection. The
+        // timeline itself also reports it, but this covers the sidebar,
+        // composer, scrollbars and other widgets the text widget cannot see.
+        if self.screen == Screen::Main
+            && self
+                .text_selection
+                .is_some_and(|selection| !selection.dragging)
+        {
+            subscriptions.push(iced::event::listen_with(
+                |event, _status, _window| match event {
+                    iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                        Some(Message::TextSelectionClear)
                     }
                     _ => None,
                 },
@@ -1132,11 +1319,19 @@ fn decode_totoz_image(bytes: &[u8]) -> Option<TotozImage> {
 
     if bytes.starts_with(b"GIF8") {
         use ::image::AnimationDecoder;
+        // Cap the iterator before collecting: `collect_frames` decodes every
+        // frame of the GIF, and a large animation used to pin the UI thread for
+        // a long time only for the first 32 frames to be kept afterwards.
+        const MAX_GIF_FRAMES: usize = 32;
         if let Ok(decoder) = ::image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)) {
-            if let Ok(frames) = decoder.into_frames().collect_frames() {
+            if let Ok(frames) = decoder
+                .into_frames()
+                .take(MAX_GIF_FRAMES)
+                .collect::<Result<Vec<_>, _>>()
+            {
                 let mut handles = Vec::new();
                 let mut delays = Vec::new();
-                for frame in frames.into_iter().take(32) {
+                for frame in frames {
                     let delay: Duration = frame.delay().into();
                     let buffer = frame.into_buffer();
                     if buffer.width() != width || buffer.height() != height {

@@ -12,6 +12,8 @@ mod message;
 mod model;
 mod net;
 mod notify;
+mod profile;
+mod selection;
 mod theme;
 mod tsv;
 mod ui;
@@ -52,7 +54,7 @@ fn parse_args() -> bool {
         match arg.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "roinroin {}\n\nUsage: roinroin [options]\n\nOptions:\n  --gb2c URL, --url URL   use this gb2c server\n  --nickname NAME         nickname sent with posts\n  --no-notifications      disable desktop notifications\n  --version, -V           print version\n  --help, -h              this help\n\nThe persistent configuration lives in\n$XDG_CONFIG_HOME/roinroin/config.toml.",
+                    "roinroin {}\n\nUsage: roinroin [options]\n\nOptions:\n  --gb2c URL, --url URL   use this gb2c server\n  --nickname NAME         nickname sent with posts\n  --no-notifications      disable desktop notifications\n  --debug-http            print HTTP status and headers to stdout\n  --profile               print UI and analysis timings to stderr\n  --version, -V           print version\n  --help, -h              this help\n\nThe persistent configuration lives in\n$XDG_CONFIG_HOME/roinroin/config.toml.",
                     env!("CARGO_PKG_VERSION")
                 );
                 return false;
@@ -73,6 +75,12 @@ fn parse_args() -> bool {
             }
             "--no-notifications" => {
                 std::env::set_var("ROINROIN_NO_NOTIFICATIONS", "1");
+            }
+            "--debug-http" => {
+                std::env::set_var(net::DEBUG_HTTP_ENV, "1");
+            }
+            "--profile" => {
+                std::env::set_var(profile::PROFILE_ENV, "1");
             }
             other => {
                 eprintln!("roinroin: option inconnue : {other}");

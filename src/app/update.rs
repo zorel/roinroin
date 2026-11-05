@@ -4,6 +4,14 @@ use super::*;
 
 impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let started = crate::profile::start();
+        let label = message.label();
+        let task = self.update_message(message);
+        crate::profile::record_update(started, label);
+        task
+    }
+
+    fn update_message(&mut self, message: Message) -> Task<Message> {
         let mut tasks: Vec<Task<Message>> = Vec::new();
         match message {
             Message::Tick => {
@@ -231,7 +239,7 @@ impl App {
                     self.status = "reconnexion…".to_owned();
                     self.error = Some(format!("{server} : {error}"));
                 }
-                net::SseEvent::Post(post) => {
+                net::SseEvent::Posts(posts) => {
                     let configured = self.config.servers.iter().any(|cfg| {
                         config::normalize_url(&cfg.url).as_deref() == Some(server.as_str())
                     });
@@ -239,10 +247,12 @@ impl App {
                         return Task::batch(tasks);
                     }
                     // A reconnecting SSE stream replays the whole tribune
-                    // history one event at a time. Buffer posts and ingest
-                    // them in batches so the conversation analysis is not
-                    // rebuilt once per post while the backlog arrives.
-                    self.pending_sse.push((server, post));
+                    // history one event at a time. The network layer already
+                    // groups posts per chunk; buffer the remaining backlog and
+                    // ingest it in batches so neither the conversation analysis
+                    // nor the widget tree is rebuilt once per post.
+                    self.pending_sse
+                        .extend(posts.into_iter().map(|post| (server.clone(), post)));
                     if !self.sse_flush_scheduled {
                         self.sse_flush_scheduled = true;
                         tasks.push(Task::perform(
@@ -301,6 +311,7 @@ impl App {
                     self.active = Some(key);
                     tasks.push(self.focus_composer());
                     self.selected = None;
+                    self.text_selection = None;
                     self.hovered_post = None;
                     self.hovered_link_post = None;
                     self.hovered_info = None;
@@ -331,6 +342,39 @@ impl App {
                     self.open_conversation(key);
                 }
             }
+            Message::TextSelectionStart(position) => {
+                self.text_selection = Some(TextSelection {
+                    anchor: position,
+                    focus: position,
+                    dragging: true,
+                });
+            }
+            Message::TextSelectionUpdate(position) => {
+                if let Some(selection) = self.text_selection.as_mut() {
+                    selection.focus = position;
+                }
+            }
+            Message::TextSelectionEnd => {
+                if let Some(selection) = self.text_selection.as_mut() {
+                    selection.dragging = false;
+                }
+            }
+            Message::TextSelectionClear => {
+                self.text_selection = None;
+            }
+            Message::CopyTextSelection => {
+                if self.text_selection.is_some() {
+                    tasks.push(
+                        iced::advanced::widget::operate(CollectSelection::default())
+                            .map(Message::CopySelection),
+                    );
+                }
+            }
+            Message::CopySelection(text) => {
+                if !text.is_empty() {
+                    tasks.push(iced::clipboard::write(text));
+                }
+            }
             Message::ConversationScrolled(anchor, at_bottom) => {
                 if let Some(pane) = self
                     .conversations
@@ -346,8 +390,10 @@ impl App {
             }
             Message::ClearSelection => {
                 self.selected = None;
+                self.text_selection = None;
             }
             Message::JumpTo(key) => {
+                self.text_selection = None;
                 if self.active.as_ref() != Some(&key.tribune) {
                     self.active = Some(key.tribune.clone());
                     self.mark_active_read();
@@ -664,11 +710,13 @@ impl App {
             }
             Message::OpenSettings => {
                 self.totoz_suggest.clear();
+                self.text_selection = None;
                 self.settings = SettingsDraft::from_config(&self.config);
                 self.screen = Screen::Settings;
             }
             Message::OpenTotoz => {
                 self.totoz_suggest.clear();
+                self.text_selection = None;
                 self.screen = Screen::Totoz;
                 tasks.push(focus_text_input(&self.totoz_search_id));
                 if self.totoz.results.is_empty() && !self.totoz.query.trim().is_empty() {
@@ -677,6 +725,7 @@ impl App {
             }
             Message::OpenEmoji => {
                 self.totoz_suggest.clear();
+                self.text_selection = None;
                 self.screen = Screen::Emoji;
                 tasks.push(focus_text_input(&self.emoji_search_id));
                 if self.emoji.results.is_empty() {
@@ -706,6 +755,12 @@ impl App {
             }
             Message::LinkClicked(action) => {
                 tasks.extend(self.handle_link(action));
+            }
+            Message::LinkRightClicked(action) => {
+                if let LinkAction::Url(url) = action {
+                    tasks.push(iced::clipboard::write(url));
+                    self.status = "lien copié".to_owned();
+                }
             }
             Message::OpenUrl(url) => {
                 if !url.trim().is_empty() {

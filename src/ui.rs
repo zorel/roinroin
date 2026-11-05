@@ -22,6 +22,13 @@ use crate::model::{PostKey, SourceId, TribuneKey};
 use crate::theme as colors;
 
 pub fn view(app: &App) -> Element<'_, Message> {
+    let started = crate::profile::start();
+    let element = view_inner(app);
+    crate::profile::record_view(started, app.posts.len(), app.conversations.len());
+    element
+}
+
+fn view_inner(app: &App) -> Element<'_, Message> {
     let content = match app.screen {
         Screen::Main => main_view(app),
         Screen::Settings => settings_view(app),
@@ -67,7 +74,7 @@ fn post_preview_overlay(app: &App) -> Element<'_, Message> {
         .iter()
         .position(|item| item == key)
         .unwrap_or(0);
-    let content = post_card_body(app, key.clone(), index, CardMode::PREVIEW);
+    let content = post_card_body(app, key.clone(), index, CardMode::PREVIEW, None);
     let window_width = app.window_size.width.max(1.0);
     let window_height = app.window_size.height.max(1.0);
     let content_left = app.sidebar_width + 6.0;
@@ -566,7 +573,7 @@ impl CardMode {
 }
 
 fn post_card<'a>(app: &'a App, key: PostKey, index: usize) -> Element<'a, Message> {
-    let content = post_card_body(app, key.clone(), index, CardMode::MAIN);
+    let content = post_card_body(app, key.clone(), index, CardMode::MAIN, Some(index as u64));
     let visible_key = key.key();
     crate::visible::Visible::new(
         content,
@@ -582,6 +589,7 @@ fn post_card_body<'a>(
     key: PostKey,
     index: usize,
     mode: CardMode,
+    selection_order: Option<u64>,
 ) -> Element<'a, Message> {
     let Some(post) = app.posts.get(&key) else {
         return Space::new().into();
@@ -608,18 +616,26 @@ fn post_card_body<'a>(
     } else {
         colors::CLOCK
     };
-    let clock = container(
-        text(post.time().clock())
-            .size(POST_FONT_SIZE)
-            .font(Font {
-                family: iced::font::Family::Monospace,
-                weight: iced::font::Weight::Bold,
-                ..Font::DEFAULT
-            })
-            .color(clock_color),
+    // Hover the clock only: a `mouse_area` with `on_move` on the whole card
+    // published a message for every pointer move, rebuilding the complete
+    // timeline each time. Enter/exit gives the same highlight without the
+    // event flood.
+    let clock = mouse_area(
+        container(
+            text(post.time().clock())
+                .size(POST_FONT_SIZE)
+                .font(Font {
+                    family: iced::font::Family::Monospace,
+                    weight: iced::font::Weight::Bold,
+                    ..Font::DEFAULT
+                })
+                .color(clock_color),
+        )
+        .width(Length::Fixed(CLOCK_WIDTH))
+        .align_x(Alignment::Start),
     )
-    .width(Length::Fixed(CLOCK_WIDTH))
-    .align_x(Alignment::Start);
+    .on_enter(Message::HoverPost(Some(key.clone())))
+    .on_exit(Message::HoverPost(None));
 
     let (status, status_color) = if hidden {
         ("🚫", colors::DANGER)
@@ -687,6 +703,9 @@ fn post_card_body<'a>(
     if mode.link_hover {
         identity = identity.on_link_hover(Message::HoverLink);
     }
+    if let Some(order) = selection_order {
+        identity = identity.selectable(order * 2, app.text_selection);
+    }
 
     let mut spans: Vec<Span<'a, LinkAction>> = Vec::new();
     if hidden {
@@ -707,10 +726,15 @@ fn post_card_body<'a>(
         .size(POST_FONT_SIZE)
         .width(Fill);
     if mode.interactive {
-        message = message.on_link_click(Message::LinkClicked);
+        message = message
+            .on_link_click(Message::LinkClicked)
+            .on_link_right_click(Message::LinkRightClicked);
     }
     if mode.link_hover {
         message = message.on_link_hover(Message::HoverLink);
+    }
+    if let Some(order) = selection_order {
+        message = message.selectable(order * 2 + 1, app.text_selection);
     }
 
     let rail = container(Space::new())
@@ -739,16 +763,8 @@ fn post_card_body<'a>(
     .style(move |theme| colors::post_row(theme, selected, hovered, hidden, index));
 
     if mode.interactive {
-        let hover_key = key.clone();
         let right_click_key = key.clone();
         iced::widget::mouse_area(card)
-            .on_move(move |point| {
-                if point.x <= 90.0 {
-                    Message::HoverPost(Some(hover_key.clone()))
-                } else {
-                    Message::HoverPost(None)
-                }
-            })
             .on_exit(Message::HoverExit)
             .on_press(Message::PostClicked(key))
             .on_right_press(Message::PostRightClicked(right_click_key))
@@ -786,17 +802,22 @@ fn conversation_post_card<'a>(app: &'a App, key: PostKey, index: usize) -> Eleme
         colors::CLOCK
     };
 
-    let mut top = row![text(post.time().clock())
-        .size(FONT_SIZE)
-        .font(Font {
-            family: iced::font::Family::Monospace,
-            weight: iced::font::Weight::Bold,
-            ..Font::DEFAULT
-        })
-        .color(clock_color),]
-    .spacing(5)
-    .align_y(Alignment::Center)
-    .width(Fill);
+    let clock = mouse_area(
+        text(post.time().clock())
+            .size(FONT_SIZE)
+            .font(Font {
+                family: iced::font::Family::Monospace,
+                weight: iced::font::Weight::Bold,
+                ..Font::DEFAULT
+            })
+            .color(clock_color),
+    )
+    .on_enter(Message::HoverPost(Some(key.clone())))
+    .on_exit(Message::HoverPost(None));
+    let mut top = row![clock]
+        .spacing(5)
+        .align_y(Alignment::Center)
+        .width(Fill);
 
     let (status, status_color) = if hidden {
         ("🚫", colors::DANGER)
@@ -844,7 +865,8 @@ fn conversation_post_card<'a>(app: &'a App, key: PostKey, index: usize) -> Eleme
     let message = HoverRich::with_spans(spans)
         .size(FONT_SIZE)
         .width(Fill)
-        .on_link_click(Message::LinkClicked);
+        .on_link_click(Message::LinkClicked)
+        .on_link_right_click(Message::LinkRightClicked);
 
     let rail = container(Space::new())
         .width(3)
@@ -867,16 +889,8 @@ fn conversation_post_card<'a>(app: &'a App, key: PostKey, index: usize) -> Eleme
     .width(Fill)
     .style(move |theme| colors::post_row(theme, selected, hovered, hidden, index));
 
-    let hover_key = key.clone();
     let right_click_key = key.clone();
     iced::widget::mouse_area(card)
-        .on_move(move |point| {
-            if point.x <= 75.0 {
-                Message::HoverPost(Some(hover_key.clone()))
-            } else {
-                Message::HoverPost(None)
-            }
-        })
         .on_exit(Message::HoverExit)
         .on_press(Message::PostClicked(key))
         .on_right_press(Message::PostRightClicked(right_click_key))
@@ -1114,6 +1128,7 @@ fn composer(app: &App) -> Element<'_, Message> {
             .padding([8, 10])
             .width(Fill)
             .style(colors::text_input_style),
+        &app.composer,
         app.composer_caret,
         app.composer_selection,
         Message::ComposerCursor,

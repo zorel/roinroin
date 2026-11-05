@@ -21,8 +21,10 @@ impl App {
                 )
                 .collect();
             let identities = self.config.my_identities();
+            let started = crate::profile::start();
             self.analysis =
                 conversation::analyze(&self.posts, &blocked, &identities, self.now.naive_local());
+            crate::profile::record_analysis(started, self.posts.len());
             self.plop_cache.clear();
             for (key, post) in &self.posts {
                 if self.config.plop_list.contains(post.info.trim()) {

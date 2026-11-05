@@ -56,6 +56,39 @@ pub fn client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+pub const DEBUG_HTTP_ENV: &str = "ROINROIN_DEBUG_HTTP";
+
+fn debug_http_enabled() -> bool {
+    std::env::var_os(DEBUG_HTTP_ENV)
+        .map(|value| {
+            let value = value.to_string_lossy();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false)
+}
+
+/// Print the status line and headers of an HTTP response to stdout when
+/// `--debug-http` is enabled. Bodies are never printed: they can be large and
+/// may contain private posts.
+fn log_http_response(response: &reqwest::Response) {
+    if !debug_http_enabled() {
+        return;
+    }
+    println!(
+        "[http] {:?} {} {}",
+        response.version(),
+        response.status(),
+        response.url()
+    );
+    for (name, value) in response.headers() {
+        println!(
+            "[http] {name}: {}",
+            value.to_str().unwrap_or("<valeur non UTF-8>")
+        );
+    }
+    println!("[http]");
+}
+
 fn trim_url(url: &str) -> &str {
     url.trim_end_matches('/')
 }
@@ -82,6 +115,7 @@ pub async fn fetch_server_info(
     );
 
     let response = list.map_err(|error| format!("gb2c injoignable : {error}"))?;
+    log_http_response(&response);
     if !response.status().is_success() {
         return Err(format!("gb2c /list : HTTP {}", response.status()));
     }
@@ -98,6 +132,7 @@ pub async fn fetch_server_info(
 
     let mut blocked = BTreeSet::new();
     if let Ok(response) = config {
+        log_http_response(&response);
         if response.status().is_success() {
             if let Ok(body) = read_bounded(response, 256 * 1024).await {
                 let text = String::from_utf8_lossy(&body);
@@ -131,6 +166,7 @@ pub async fn fetch_board(client: &reqwest::Client, board: &Board) -> Result<Vec<
         .send()
         .await
         .map_err(|error| format!("{} : {error}", board.name))?;
+    log_http_response(&response);
     if !response.status().is_success() {
         return Err(format!("{} : HTTP {}", board.name, response.status()));
     }
@@ -171,6 +207,7 @@ pub async fn post_gb2c(
         .send()
         .await
         .map_err(|error| format!("envoi impossible : {error}"))?;
+    log_http_response(&response);
     if !response.status().is_success() {
         return Err(format!("gb2c : HTTP {}", response.status()));
     }
@@ -231,6 +268,7 @@ pub async fn post_board(
         .send()
         .await
         .map_err(|error| format!("envoi vers {} impossible : {error}", board.name))?;
+    log_http_response(&response);
     if !response.status().is_success() {
         return Err(format!("{} : HTTP {}", board.name, response.status()));
     }
@@ -253,6 +291,7 @@ pub async fn search_totoz(
         .send()
         .await
         .map_err(|error| format!("totoz : {error}"))?;
+    log_http_response(&response);
     if !response.status().is_success() {
         return Err(format!("totoz : HTTP {}", response.status()));
     }
@@ -281,6 +320,7 @@ pub async fn search_totoz_gb2c(
         .send()
         .await
         .map_err(|error| format!("totoz gb2c : {error}"))?;
+    log_http_response(&response);
     if !response.status().is_success() {
         return Err(format!("totoz gb2c : HTTP {}", response.status()));
     }
@@ -369,6 +409,7 @@ pub async fn fetch_totoz_image(
         .send()
         .await
         .map_err(|error| format!("totoz : {error}"))?;
+    log_http_response(&response);
     if !response.status().is_success() {
         return Err(format!("totoz : HTTP {}", response.status()));
     }
@@ -398,6 +439,7 @@ pub async fn fetch_link_metadata(
         .await
         .map_err(|error| format!("lien : {error}"))?;
 
+    log_http_response(&response);
     let status = response.status();
     if matches!(
         status,
@@ -476,6 +518,7 @@ pub async fn search_emoji(
         .send()
         .await
         .map_err(|error| format!("emoji : {error}"))?;
+    log_http_response(&response);
     if !response.status().is_success() {
         return Err(format!("emoji : HTTP {}", response.status()));
     }
@@ -509,6 +552,7 @@ pub async fn refresh_linuxfr(
         .send()
         .await
         .map_err(|error| format!("linuxfr : {error}"))?;
+    log_http_response(&response);
     if !response.status().is_success() {
         return Err(format!("linuxfr : HTTP {}", response.status()));
     }
@@ -579,7 +623,11 @@ pub struct SseConfig {
 pub enum SseEvent {
     Connected,
     Disconnected(String),
-    Post(Post),
+    /// Posts parsed from one network chunk. A reconnecting stream replays the
+    /// whole history, so delivering one message per post made the UI rebuild
+    /// its entire widget tree thousands of times in a row. Grouping by chunk
+    /// keeps the per-post parsing but collapses the rendering work.
+    Posts(Vec<Post>),
 }
 
 /// Build the long-lived gb2c poll stream. gb2c closes each connection after
@@ -638,6 +686,7 @@ async fn poll_once(
         .send()
         .await
         .map_err(|error| format!("connexion gb2c : {error}"))?;
+    log_http_response(&response);
     if !response.status().is_success() {
         return Err(format!("gb2c /poll : HTTP {}", response.status()));
     }
@@ -649,6 +698,7 @@ async fn poll_once(
     let mut stream = response.bytes_stream();
     let mut buffer = BytesMut::with_capacity(16 * 1024);
     let mut data = String::new();
+    let mut posts = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| format!("flux gb2c : {error}"))?;
         buffer.extend_from_slice(&chunk);
@@ -662,10 +712,7 @@ async fn poll_once(
             if line.is_empty() {
                 if !data.is_empty() {
                     if let Some(post) = parse_post_json(&data) {
-                        output
-                            .send(SseEvent::Post(post))
-                            .await
-                            .map_err(|_| "subscription fermée".to_owned())?;
+                        posts.push(post);
                     }
                     data.clear();
                 }
@@ -689,6 +736,18 @@ async fn poll_once(
                 }
             }
         }
+        if !posts.is_empty() {
+            output
+                .send(SseEvent::Posts(std::mem::take(&mut posts)))
+                .await
+                .map_err(|_| "subscription fermée".to_owned())?;
+        }
+    }
+    if !posts.is_empty() {
+        output
+            .send(SseEvent::Posts(posts))
+            .await
+            .map_err(|_| "subscription fermée".to_owned())?;
     }
     Ok(())
 }
