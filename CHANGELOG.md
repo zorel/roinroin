@@ -1,5 +1,17 @@
 # Journal des modifications
 
+## [0.4.1] - 2026-11-07
+
+### Corrections
+
+- la connexion SSE gb2c est surveillée : une inactivité de 75 s force une
+  reconnexion au lieu de laisser l'interface connectée à un flux mort ;
+- les fermetures normales du flux (limite d'une heure côté gb2c, timeout d'un
+  proxy ou d'un NAT) ne font plus clignoter l'état du serveur en erreur ;
+- les posts rejoués par gb2c à chaque reconnexion sont filtrés, et les posts
+  identiques reçus à nouveau (SSE ou board direct) ne déclenchent plus une
+  réanalyse complète de la conversation.
+
 ## [0.4.0] - 2026-11-05
 
 ### Ajouts
