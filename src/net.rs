@@ -3,9 +3,9 @@
 //! Everything here is plain async Rust. The UI turns each operation into an
 //! iced `Task` or `Subscription`; no blocking call is made on the GUI thread.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use futures::{SinkExt, Stream, StreamExt};
@@ -622,6 +622,9 @@ pub struct SseConfig {
 #[derive(Debug, Clone)]
 pub enum SseEvent {
     Connected,
+    /// A connection attempt failed. Normal stream closes are not reported:
+    /// gb2c closes every poll after an hour, and proxy/NAT idle timeouts are
+    /// routine, so flagging them made the status blink red for no reason.
     Disconnected(String),
     /// Posts parsed from one network chunk. A reconnecting stream replays the
     /// whole history, so delivering one message per post made the UI rebuild
@@ -630,16 +633,56 @@ pub enum SseEvent {
     Posts(Vec<Post>),
 }
 
+/// gb2c sends no heartbeat on a quiet tribune. Stop waiting after this long so
+/// a half-open connection (proxy idle timeout, NAT expiry, suspended laptop)
+/// is replaced instead of leaving the UI connected to a stream that will never
+/// deliver anything again. The bound is close to common one-minute proxy idle
+/// timeouts: a clean proxy close ends the stream by itself, while a silently
+/// dropped connection is recovered shortly after.
+const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
+
+/// A stream that stayed open this long is healthy even when it ends without an
+/// error (gb2c's one-hour limit or an idle reconnect). Such closes keep the
+/// reconnect delay at its minimum instead of growing the backoff.
+const SSE_HEALTHY_AFTER: Duration = Duration::from_secs(10);
+
 /// Build the long-lived gb2c poll stream. gb2c closes each connection after
 /// one hour, so the loop transparently reconnects with exponential backoff.
 pub fn sse_stream(config: SseConfig) -> impl Stream<Item = SseEvent> {
+    sse_stream_with(
+        config,
+        SSE_IDLE_TIMEOUT,
+        SSE_HEALTHY_AFTER,
+        Duration::from_secs(1),
+    )
+}
+
+fn sse_stream_with(
+    config: SseConfig,
+    idle_timeout: Duration,
+    healthy_after: Duration,
+    retry_delay: Duration,
+) -> impl Stream<Item = SseEvent> {
     iced::stream::channel(512, move |mut output| async move {
         let client = client();
         let mut attempt = 0u32;
+        // gb2c replays the latest posts of every filtered tribune on each
+        // connection. Remember the highest id already delivered so a normal
+        // reconnect only hands genuinely new posts to the UI.
+        let mut seen = BTreeMap::<String, i64>::new();
         loop {
-            match poll_once(&client, &config, &mut output).await {
-                Ok(()) => {
+            let started = Instant::now();
+            match poll_once(&client, &config, &mut output, &mut seen, idle_timeout).await {
+                Ok(()) if started.elapsed() >= healthy_after => {
+                    // Server-side one-hour close or deliberate idle reconnect:
+                    // reconnect quickly and keep the last known UI state.
                     attempt = 0;
+                }
+                Ok(()) => {
+                    // The stream opened and closed almost immediately. Treat
+                    // it as a failure so a misbehaving server cannot keep the
+                    // client in a one-second reconnect loop.
+                    attempt = (attempt + 1).min(6);
                     if output
                         .send(SseEvent::Disconnected("flux fermé, reconnexion".into()))
                         .await
@@ -656,14 +699,14 @@ pub fn sse_stream(config: SseConfig) -> impl Stream<Item = SseEvent> {
                 }
             }
             let delay = match attempt {
-                0 => 1,
-                1 => 2,
-                2 => 4,
-                3 => 8,
-                4 => 16,
-                _ => 30,
+                0 => retry_delay,
+                1 => retry_delay * 2,
+                2 => retry_delay * 4,
+                3 => retry_delay * 8,
+                4 => retry_delay * 16,
+                _ => retry_delay * 30,
             };
-            tokio::time::sleep(Duration::from_secs(delay)).await;
+            tokio::time::sleep(delay).await;
         }
     })
 }
@@ -672,6 +715,8 @@ async fn poll_once(
     client: &reqwest::Client,
     config: &SseConfig,
     output: &mut futures::channel::mpsc::Sender<SseEvent>,
+    seen: &mut BTreeMap<String, i64>,
+    idle_timeout: Duration,
 ) -> Result<(), String> {
     let mut url = url::Url::parse(&api_url(&config.server_url, "/gb2c/poll"))
         .map_err(|error| format!("URL gb2c invalide : {error}"))?;
@@ -699,8 +744,15 @@ async fn poll_once(
     let mut buffer = BytesMut::with_capacity(16 * 1024);
     let mut data = String::new();
     let mut posts = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| format!("flux gb2c : {error}"))?;
+    loop {
+        let chunk = match tokio::time::timeout(idle_timeout, stream.next()).await {
+            Ok(Some(chunk)) => chunk.map_err(|error| format!("flux gb2c : {error}"))?,
+            Ok(None) => break,
+            // No event and no comment arrived for a long time. Reconnect
+            // rather than waiting forever on a connection a middlebox may
+            // already have discarded.
+            Err(_) => break,
+        };
         buffer.extend_from_slice(&chunk);
         if buffer.len() > 4 * 1024 * 1024 {
             return Err("flux gb2c trop volumineux".into());
@@ -711,9 +763,7 @@ async fn poll_once(
             let line = line.trim_end_matches(['\r', '\n']);
             if line.is_empty() {
                 if !data.is_empty() {
-                    if let Some(post) = parse_post_json(&data) {
-                        posts.push(post);
-                    }
+                    push_new_post(&data, seen, &mut posts);
                     data.clear();
                 }
                 continue;
@@ -743,6 +793,11 @@ async fn poll_once(
                 .map_err(|_| "subscription fermée".to_owned())?;
         }
     }
+    // The server may have closed right after the last data line without a
+    // trailing blank line; do not silently discard that final event.
+    if !data.is_empty() {
+        push_new_post(&data, seen, &mut posts);
+    }
     if !posts.is_empty() {
         output
             .send(SseEvent::Posts(posts))
@@ -750,6 +805,21 @@ async fn poll_once(
             .map_err(|_| "subscription fermée".to_owned())?;
     }
     Ok(())
+}
+
+/// Remember only posts that have not been delivered yet. gb2c ignores resume
+/// offsets and replays its whole retained history on every connection; without
+/// this filter a reconnect re-parsed and re-ingested up to hundreds of posts
+/// per tribune, rebuilding the conversation analysis for nothing.
+fn push_new_post(data: &str, seen: &mut BTreeMap<String, i64>, posts: &mut Vec<Post>) {
+    let Some(post) = parse_post_json(data) else {
+        return;
+    };
+    let previous = seen.get(&post.tribune).copied().unwrap_or(0);
+    if post.id > previous {
+        seen.insert(post.tribune.clone(), post.id);
+        posts.push(post);
+    }
 }
 
 pub fn parse_post_json(data: &str) -> Option<Post> {
@@ -1039,5 +1109,89 @@ mod tests {
         assert!(request.starts_with("POST /post"));
         assert!(request.contains("message=hello"));
         assert!(request.contains("user-agent: dave") || request.contains("User-Agent: dave"));
+    }
+
+    #[test]
+    fn replay_only_keeps_posts_never_delivered() {
+        let mut seen = BTreeMap::new();
+        let mut posts = Vec::new();
+        push_new_post(r#"{"id":1,"tribune":"a"}"#, &mut seen, &mut posts);
+        push_new_post(r#"{"id":1,"tribune":"a"}"#, &mut seen, &mut posts);
+        push_new_post(r#"{"id":2,"tribune":"a"}"#, &mut seen, &mut posts);
+        push_new_post(r#"{"id":1,"tribune":"b"}"#, &mut seen, &mut posts);
+        assert_eq!(
+            posts
+                .iter()
+                .map(|post| (post.tribune.as_str(), post.id))
+                .collect::<Vec<_>>(),
+            vec![("a", 1), ("a", 2), ("b", 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_stream_reconnects_and_skips_replayed_posts() {
+        use futures::StreamExt as _;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const EVENT_STREAM_HEADER: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            // Keep the first socket open: the client must notice the silence
+            // and reconnect on its own.
+            let mut held = Vec::new();
+            for body in [
+                format!(
+                    "{EVENT_STREAM_HEADER}data: {{\"id\":1,\"tribune\":\"t\"}}\n\n"
+                ),
+                format!(
+                    "{EVENT_STREAM_HEADER}data: {{\"id\":1,\"tribune\":\"t\"}}\n\ndata: {{\"id\":2,\"tribune\":\"t\"}}\n\n"
+                ),
+            ] {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut request = [0u8; 4096];
+                let count = socket.read(&mut request).await.expect("read");
+                assert!(count > 0, "empty request");
+                socket.write_all(body.as_bytes()).await.expect("write");
+                socket.flush().await.expect("flush");
+                held.push(socket);
+            }
+        });
+
+        let config = SseConfig {
+            server_url: format!("http://{address}"),
+            filter: Vec::new(),
+            epoch: 0,
+        };
+        let mut stream = Box::pin(sse_stream_with(
+            config,
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        ));
+        let mut posts = Vec::new();
+        let mut disconnected = Vec::new();
+        for _ in 0..8 {
+            let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("event timeout")
+                .expect("event");
+            match event {
+                SseEvent::Connected => {}
+                SseEvent::Disconnected(error) => disconnected.push(error),
+                SseEvent::Posts(batch) => posts.extend(batch),
+            }
+            if posts.iter().any(|post| post.id == 2) {
+                break;
+            }
+        }
+        server.abort();
+        assert_eq!(
+            posts.iter().map(|post| post.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(disconnected.is_empty(), "{disconnected:?}");
     }
 }

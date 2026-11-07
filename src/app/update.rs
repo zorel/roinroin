@@ -246,11 +246,20 @@ impl App {
                     if !configured {
                         return Task::batch(tasks);
                     }
-                    // A reconnecting SSE stream replays the whole tribune
-                    // history one event at a time. The network layer already
-                    // groups posts per chunk; buffer the remaining backlog and
-                    // ingest it in batches so neither the conversation analysis
-                    // nor the widget tree is rebuilt once per post.
+                    if let Some(state) = self.servers.get_mut(&server) {
+                        // Receiving a post proves the stream is alive even if
+                        // the initial Connected event was missed during a
+                        // subscription restart.
+                        state.connected = true;
+                        state.last_error = None;
+                        state.last_event = Some(Instant::now());
+                    }
+                    // A fresh SSE subscription replays the whole tribune
+                    // history. The network layer groups posts per chunk and
+                    // drops duplicates across reconnects, but a filter or
+                    // epoch change still sends a backlog: buffer it and ingest
+                    // in batches so neither the conversation analysis nor the
+                    // widget tree is rebuilt once per post.
                     self.pending_sse
                         .extend(posts.into_iter().map(|post| (server.clone(), post)));
                     if !self.sse_flush_scheduled {

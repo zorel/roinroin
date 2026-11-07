@@ -22,7 +22,8 @@ et reprend les fonctions des clients existants `gb3tui`, `gb3-android` et
 
 ### Sources et réseau
 
-- flux **SSE** gb2c en direct, avec reconnexion automatique et backoff ;
+- flux **SSE** gb2c en direct, avec reconnexion automatique, backoff,
+  surveillance d'inactivité et filtrage des posts déjà reçus lors des rejeux ;
 - liste des tribunes et identités bloquées découvertes via `/gb2c/list` et
   `/gb2c/config` ;
 - boards directs **TSV** et **XML** (`<board><post>…`) tolérants aux réponses

@@ -136,6 +136,7 @@ impl App {
         label: Option<&str>,
     ) -> Vec<Task<Message>> {
         let mut new_links = BTreeSet::new();
+        let mut changed = false;
         for mut post in posts {
             if post.id <= 0 || post.tribune.trim().is_empty() {
                 continue;
@@ -146,10 +147,18 @@ impl App {
             if is_new {
                 self.pending_notifications.push(key.clone());
                 new_links.extend(post_links(&post.message));
+            } else if self.posts.get(&key) == Some(&post) {
+                // SSE reconnects replay stored history and direct boards are
+                // polled in full every 30 seconds. An identical post needs no
+                // insertion and must not invalidate the conversation analysis.
+                continue;
             }
+            changed = true;
             self.posts.insert(key, post);
         }
-        self.analysis_dirty = true;
+        if changed {
+            self.analysis_dirty = true;
+        }
 
         let mut tasks = Vec::new();
         for url in new_links {
