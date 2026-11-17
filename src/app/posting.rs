@@ -32,7 +32,14 @@ impl App {
 
         let client = self.client.clone();
         let nickname = self.config.nickname.clone();
-        let token = if active.name == "dlfp" {
+        let needs_linuxfr_token = match &active.source {
+            SourceId::Gb2c(_) => active.name == "dlfp",
+            SourceId::Direct(name) => self
+                .config
+                .board(name)
+                .is_some_and(|board| board.requires_oauth()),
+        };
+        let token = if needs_linuxfr_token {
             self.config
                 .linuxfr
                 .as_ref()

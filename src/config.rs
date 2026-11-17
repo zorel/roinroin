@@ -16,6 +16,13 @@ pub const DEFAULT_TOTOZ: &str = "https://nsfw.totoz.eu";
 pub const MAX_MESSAGE_LENGTH: usize = 65_536;
 pub const HISTORY_LIMIT: usize = 2_000;
 
+/// LinuxFr runs Doorkeeper 4.x with `force_ssl_in_redirect_uri` enabled, so a
+/// `http://127.0.0.1` loopback is rejected and an `https` loopback would need a
+/// self-signed certificate. The native redirect URI is exempted from that rule:
+/// LinuxFr displays the authorization code, which the user pastes into the
+/// client.
+pub const LINUXFR_REDIRECT_URI: &str = "urn:ietf:wg:oauth:2.0:oob";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum BlockedMode {
@@ -293,14 +300,20 @@ pub struct Config {
     pub totoz_server: String,
     pub blocked: BTreeSet<String>,
     pub blocked_mode: BlockedMode,
+    /// Whether the bàk also filters replies to blocked posts.
+    pub hungry: bool,
     pub plop_list: BTreeSet<String>,
     pub notifications: NotifyConfig,
     pub theme: ThemeMode,
     pub language: Language,
     pub linuxfr: Option<LinuxfrSession>,
+    /// Client credentials of roinroin's LinuxFR OAuth application, used to
+    /// authenticate without gb2c. `client_id` is public; the secret is stored
+    /// in the 0600 config file, like the refresh token.
+    pub linuxfr_client_id: String,
+    pub linuxfr_client_secret: String,
     pub draft: String,
     pub last_posted: String,
-    pub show_hidden: bool,
     pub history_limit: usize,
     pub hourly_bell: bool,
 }
@@ -318,14 +331,16 @@ impl Default for Config {
             totoz_server: DEFAULT_TOTOZ.to_owned(),
             blocked: BTreeSet::new(),
             blocked_mode: BlockedMode::Gray,
+            hungry: true,
             plop_list: BTreeSet::new(),
             notifications: NotifyConfig::default(),
             theme: ThemeMode::Dark,
             language: Language::French,
             linuxfr: None,
+            linuxfr_client_id: String::new(),
+            linuxfr_client_secret: String::new(),
             draft: String::new(),
             last_posted: String::new(),
-            show_hidden: false,
             history_limit: HISTORY_LIMIT,
             hourly_bell: false,
         }
@@ -339,6 +354,11 @@ pub struct LinuxfrSession {
     /// Unix time in seconds, 0 when unknown.
     pub expires_at: i64,
     pub login: String,
+    /// True when the token was obtained directly from LinuxFr with roinroin's
+    /// OAuth application, so it must be refreshed with the same client rather
+    /// than through gb2c's OAuth application.
+    #[serde(default)]
+    pub direct: bool,
 }
 
 impl LinuxfrSession {
@@ -394,6 +414,7 @@ impl LinuxfrSession {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_owned(),
+            direct: false,
         })
     }
 }
@@ -447,6 +468,18 @@ impl Config {
 
     pub fn board(&self, name: &str) -> Option<Board> {
         self.all_boards().into_iter().find(|b| b.name == name)
+    }
+
+    /// Non-empty LinuxFR OAuth application credentials, when direct
+    /// authentication (without gb2c) is configured.
+    pub fn linuxfr_direct_credentials(&self) -> Option<(&str, &str)> {
+        let client_id = self.linuxfr_client_id.trim();
+        let client_secret = self.linuxfr_client_secret.trim();
+        if client_id.is_empty() || client_secret.is_empty() {
+            None
+        } else {
+            Some((client_id, client_secret))
+        }
     }
 
     pub fn my_identities(&self) -> BTreeSet<String> {
@@ -657,11 +690,35 @@ mod tests {
     fn parses_linuxfr_token() {
         let session = LinuxfrSession::from_pasted("abc123").unwrap();
         assert_eq!(session.access_token, "abc123");
+        assert!(!session.direct);
         let json =
             r#"{"access_token":"tok","refresh_token":"ref","expires_in":3600,"login":"dave"}"#;
         let session = LinuxfrSession::from_pasted(json).unwrap();
         assert_eq!(session.login, "dave");
         assert_eq!(session.refresh_token, "ref");
+    }
+
+    #[test]
+    fn detects_linuxfr_direct_credentials() {
+        let mut config = Config::default();
+        assert!(config.linuxfr_direct_credentials().is_none());
+        config.linuxfr_client_id = " id ".into();
+        assert!(config.linuxfr_direct_credentials().is_none());
+        config.linuxfr_client_secret = " secret ".into();
+        assert_eq!(
+            config.linuxfr_direct_credentials(),
+            Some(("id", "secret"))
+        );
+
+        let parsed: Config = toml::from_str("nickname = \"dave\"").unwrap();
+        assert!(parsed.linuxfr_direct_credentials().is_none());
+
+        let text = toml::to_string(&config).unwrap();
+        let roundtrip: Config = toml::from_str(&text).unwrap();
+        assert_eq!(
+            roundtrip.linuxfr_direct_credentials(),
+            Some(("id", "secret"))
+        );
     }
 
     #[test]

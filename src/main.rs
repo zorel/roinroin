@@ -22,12 +22,18 @@ mod visible;
 use iced::window;
 use iced::Size;
 
+/// Bundled emoji font. Recent distributions ship `Noto Color Emoji` as a
+/// COLRv1-only font, which the text rasterizer behind iced (cosmic-text /
+/// swash) cannot draw. Twemoji Mozilla is COLRv0 and renders as color.
+const EMOJI_FONT: &[u8] = include_bytes!("../assets/TwemojiMozilla.ttf");
+
 fn main() -> iced::Result {
     if !parse_args() {
         return Ok(());
     }
     let icon = window_icon();
     iced::application(app::App::new, app::App::update, ui::view)
+        .font(EMOJI_FONT)
         .title(app::App::title)
         .theme(app::App::theme)
         .subscription(app::App::subscription)

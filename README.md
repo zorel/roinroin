@@ -30,8 +30,9 @@ et reprend les fonctions des clients existants `gb3tui`, `gb3-android` et
   malformées, avec limites de taille et nettoyage des caractères de contrôle ;
 - polling direct toutes les 30 secondes, en parallèle pour chaque board ;
 - envoi vers `/gb2c/post` ou directement vers l'URL de post du board ;
-- OAuth2 LinuxFR : ouverture de la page d'autorisation gb2c, collage du jeton
-  de retour, rafraîchissement automatique du jeton ;
+- OAuth2 LinuxFR : authentification directe depuis le client (redirection
+  native, code collé), ou via gb2c si aucun identifiant d'application n'est
+  configuré ; rafraîchissement automatique du jeton par la même voie ;
 - plusieurs serveurs gb2c configurables ;
 - pastilles d'état à droite de chaque serveur et board : vert connecté,
   bleu en cours de connexion/rafraîchissement/envoi, rouge en erreur.
@@ -42,9 +43,13 @@ et reprend les fonctions des clients existants `gb3tui`, `gb3-android` et
   `2017-06-29T13:45:01.421`, `2017-06-29 13:45:01`, `06/29#13:45:01`,
   `13:45:01`, `13:45`, suffixes `^2`/`²` et `@bouchot` ;
 - graphe de conversation : racine, réponses directes et indirectes, couleur de
-  fil stable, compteur de réponses ;
-- filtrage des identités bloquées et **propagation aux réponses** ;
-- mode `gris` (message masqué) ou `masqué` (post absent) ;
+  fil stable, compteur de réponses ; une horloge courte (`13:45`) qui vise
+  l'un de nos propres posts compte comme une réponse ;
+- boitakon (**bàk**) : filtrage des identités bloquées ; l'option `hungry`
+  filtre aussi les réponses, sinon seuls les posts de l'identité bloquée
+  sont filtrés ;
+- affichage des posts filtrés au choix : `gray` (la ligne reste visible, son
+  texte est remplacé par `[message masqué]`) ou `hide` (la ligne disparaît) ;
 - mise en page compacte sur une seule ligne, comme gb3-android : horloge,
   auteur et message partagent la même taille de police ;
 - survoler l'horloge d'un post met en évidence ce post et les norloges qui le
@@ -130,7 +135,8 @@ Prérequis :
 
 - Rust **1.88 ou plus** (`rustup` recommandé) ;
 - un environnement graphique X11 ou Wayland ;
-- une police emoji couleur (Noto Color Emoji recommandé) pour les emojis et drapeaux dans les posts ;
+- aucune police emoji système n'est nécessaire : une police couleur compatible
+  (Twemoji Mozilla, COLRv0) est embarquée dans le binaire ;
 - éventuellement `libxkbcommon` et les bibliothèques Wayland/X11 de la
   distribution (winit les utilise) ;
 - un démon de notifications pour l'intégration bureau (GNOME, KDE, mako,
@@ -220,7 +226,8 @@ Les champs importants :
 | `hidden_tribunes` | tribunes gb2c masquées (clé `gb2c:URL\|nom`) |
 | `custom_boards` | boards directs supplémentaires |
 | `blocked` | identités masquées (login ou info) |
-| `blocked_mode` | `gray` ou `hide` |
+| `blocked_mode` | posts filtrés : `gray` (ligne conservée, texte masqué) ou `hide` (ligne absente) |
+| `hungry` | la bàk filtre aussi les réponses aux posts filtrés (`true` par défaut) |
 | `plop_list` | auteurs dont le message est remplacé par un plop |
 | `totoz_server` | serveur totoz (`https://nsfw.totoz.eu` par défaut) |
 | `notifications` | activation, bigorno, réponses, tous les posts, focus |
@@ -228,6 +235,8 @@ Les champs importants :
 | `hourly_bell` | notification à chaque heure pile |
 | `theme` | `dark`, `light` ou `system` |
 | `language` | langue de l'interface (`french` pour l'instant) |
+| `linuxfr_client_id` | identifiant de l'application OAuth LinuxFR (connexion directe sans gb2c) |
+| `linuxfr_client_secret` | secret de l'application OAuth LinuxFR, stocké dans le fichier `0600` |
 
 Les boards prédéfinis sont : `dlfp`, `euromussels`, `gabuzomeu`, `moules`,
 `devnewton`, `ototu`, `reveildutroll`, `sveetch`. Il suffit de les mettre dans
@@ -235,12 +244,28 @@ Les boards prédéfinis sont : `dlfp`, `euromussels`, `gabuzomeu`, `moules`,
 
 ### LinuxFR
 
-gb2c termine l'OAuth LinuxFR par une redirection vers `/linuxfr.html#<jeton
-base64>` et ne peut pas transmettre ce fragment à un client natif. Dans les
-réglages, bouton **Ouvrir l'autorisation**, puis coller l'URL de retour (ou le
-jeton) dans le champ LinuxFR et appliquer. roinroin accepte aussi un jeton
-d'accès brut ; le rafraîchissement se fait ensuite via
-`/gb2c/linuxfr/refresh`.
+Deux méthodes d'authentification sont disponibles ; choisir la tribune
+directe `dlfp` n'impose plus de passer par gb2c.
+
+**Directe, sans gb2c.** Créer une application OAuth sur
+[linuxfr.org/api/applications](https://linuxfr.org/api/applications) avec
+l'adresse de redirection native `urn:ietf:wg:oauth:2.0:oob`, puis renseigner
+son identifiant et son secret dans les réglages. Le bouton **Ouvrir
+l'autorisation** ouvre LinuxFr ; après validation, LinuxFr affiche un code
+d'autorisation, à coller dans le champ puis à échanger avec **Connecter le
+code**. Le rafraîchissement se fait directement sur
+`https://linuxfr.org/api/oauth/token`. LinuxFr (Doorkeeper 4.x) refuse les
+redirections `http` et une boucle locale `https` imposerait un certificat
+auto-signé : la redirection native est la voie prévue pour les applications
+installées. Le secret reste dans le fichier de configuration local, créé avec
+les droits `0600`.
+
+**Via gb2c.** Si aucun identifiant d'application n'est renseigné, le bouton
+ouvre `/gb2c/linuxfr/authorize`. gb2c termine l'OAuth par une redirection vers
+`/linuxfr.html#<jeton base64>` et ne peut pas transmettre ce fragment à un
+client natif : coller l'URL de retour (ou le jeton) dans le champ LinuxFR et
+appliquer. roinroin accepte aussi un jeton d'accès brut ; le rafraîchissement
+se fait alors via `/gb2c/linuxfr/refresh`.
 
 ## Raccourcis
 
@@ -302,3 +327,8 @@ fiables (bornes de taille, UTF-8 tolérant, caractères de contrôle filtrés).
 ## Licence
 
 MIT. Voir [`LICENSE`](LICENSE).
+
+La police embarquée `assets/TwemojiMozilla.ttf` garde sa licence propre : code
+de [twemoji-colr](https://github.com/mozilla/twemoji-colr) sous Apache-2.0,
+dessins [Twemoji](https://twitter.github.io/twemoji/) sous CC-BY-4.0. Voir
+[`assets/TwemojiMozilla.LICENSE.md`](assets/TwemojiMozilla.LICENSE.md).

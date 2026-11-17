@@ -9,15 +9,22 @@ selected_boards = ["devnewton", "gabuzomeu"]
 hidden_tribunes = []
 totoz_server = "https://nsfw.totoz.eu"
 blocked = []
-blocked_mode = "gray"          # "gray" ou "hide"
+blocked_mode = "gray"          # "gray" (ligne conservée, en gris) ou "hide" (ligne masquée)
+hungry = true                  # la bàk filtre aussi les réponses aux posts filtrés
 plop_list = ["troll"]         # auteurs remplacés par pika/plop/prout/grouik/meuh
 theme = "dark"                 # "dark", "light" ou "system"
 language = "french"            # conservé pour la traduction à venir
 draft = ""
 last_posted = ""
-show_hidden = false
 history_limit = 2000
 hourly_bell = false
+
+# Connexion directe à LinuxFR sans gb2c. Créer une application sur
+# https://linuxfr.org/api/applications avec l'adresse de redirection native
+# urn:ietf:wg:oauth:2.0:oob, puis recopier ici son identifiant et son secret.
+# Laisser vide pour passer par gb2c.
+linuxfr_client_id = ""
+linuxfr_client_secret = ""
 
 # Plusieurs serveurs gb2c peuvent être suivis en même temps que les boards
 # directs. Chaque serveur a son propre flux SSE.

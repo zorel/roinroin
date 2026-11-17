@@ -21,6 +21,10 @@ use crate::tsv;
 
 pub const USER_AGENT: &str = concat!("roinroin/", env!("CARGO_PKG_VERSION"));
 
+const LINUXFR_AUTHORIZE_URL: &str = "https://linuxfr.org/api/oauth/authorize";
+const LINUXFR_TOKEN_URL: &str = "https://linuxfr.org/api/oauth/token";
+const LINUXFR_ME_URL: &str = "https://linuxfr.org/api/v1/me";
+
 #[derive(Debug, Clone, Default)]
 pub struct ServerInfo {
     pub tribunes: Vec<String>,
@@ -540,6 +544,183 @@ struct LinuxfrRefresh {
     expires_in: i64,
 }
 
+/// Response of `/api/oauth/token` for the direct flow, including Doorkeeper's
+/// error fields so a failed exchange can be reported instead of a JSON parse
+/// error.
+#[derive(Debug, Default, Deserialize)]
+struct LinuxfrToken {
+    #[serde(default)]
+    access_token: String,
+    #[serde(default)]
+    refresh_token: String,
+    #[serde(default)]
+    expires_in: i64,
+    #[serde(default)]
+    error: String,
+    #[serde(default)]
+    error_description: String,
+}
+
+/// Build the LinuxFR authorization page URL for roinroin's own OAuth
+/// application. With the native redirect URI, LinuxFr displays the
+/// authorization code instead of redirecting to a server.
+pub fn linuxfr_authorize_url(client_id: &str, redirect_uri: &str) -> String {
+    let mut url = url::Url::parse(LINUXFR_AUTHORIZE_URL)
+        .expect("the LinuxFR authorization URL is a valid constant");
+    url.query_pairs_mut()
+        .append_pair("client_id", client_id.trim())
+        .append_pair("response_type", "code")
+        .append_pair("scope", "account board")
+        .append_pair("redirect_uri", redirect_uri);
+    url.into()
+}
+
+/// Extract the authorization code from a pasted value. LinuxFr displays a bare
+/// code; a full callback URL is also accepted in case the browser shows one.
+pub fn extract_linuxfr_code(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.starts_with("http://") || value.starts_with("https://") {
+        let url = url::Url::parse(value).ok()?;
+        return url
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .map(|(_, value)| value.into_owned())
+            .filter(|code| !code.is_empty());
+    }
+    Some(value.to_owned())
+}
+
+/// Exchange an authorization code for an access token, then fetch the login
+/// shown in the UI. A failed `/me` call does not invalidate the token.
+pub async fn exchange_linuxfr_code(
+    client: &reqwest::Client,
+    client_id: &str,
+    client_secret: &str,
+    code: &str,
+    redirect_uri: &str,
+) -> Result<LinuxfrSession, String> {
+    let data = request_linuxfr_token(
+        client,
+        LINUXFR_TOKEN_URL,
+        &[
+            ("client_id", client_id.trim()),
+            ("client_secret", client_secret.trim()),
+            ("code", code),
+            ("grant_type", "authorization_code"),
+            ("redirect_uri", redirect_uri),
+        ],
+    )
+    .await?;
+    let login = fetch_linuxfr_login(client, &data.access_token)
+        .await
+        .unwrap_or_default();
+    Ok(linuxfr_session(data, "", login))
+}
+
+/// Refresh a token directly against LinuxFR, without gb2c.
+pub async fn refresh_linuxfr_direct(
+    client: &reqwest::Client,
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+) -> Result<LinuxfrSession, String> {
+    let data = request_linuxfr_token(
+        client,
+        LINUXFR_TOKEN_URL,
+        &[
+            ("client_id", client_id.trim()),
+            ("client_secret", client_secret.trim()),
+            ("refresh_token", refresh_token),
+            ("grant_type", "refresh_token"),
+        ],
+    )
+    .await?;
+    Ok(linuxfr_session(data, refresh_token, String::new()))
+}
+
+async fn request_linuxfr_token(
+    client: &reqwest::Client,
+    token_url: &str,
+    params: &[(&str, &str)],
+) -> Result<LinuxfrToken, String> {
+    let response = client
+        .post(token_url)
+        .form(params)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|error| format!("LinuxFR : {error}"))?;
+    log_http_response(&response);
+    let status = response.status();
+    let body = read_bounded(response, 64 * 1024)
+        .await
+        .map_err(|error| format!("LinuxFR : {error}"))?;
+    let data: LinuxfrToken = serde_json::from_slice(&body)
+        .map_err(|_| format!("LinuxFR : réponse illisible (HTTP {status})"))?;
+    if !status.is_success() || !data.error.is_empty() {
+        let detail = if !data.error_description.is_empty() {
+            data.error_description
+        } else if !data.error.is_empty() {
+            data.error
+        } else {
+            format!("HTTP {status}")
+        };
+        return Err(format!("LinuxFR : {detail}"));
+    }
+    if data.access_token.trim().is_empty() {
+        return Err("LinuxFR : jeton vide".into());
+    }
+    Ok(data)
+}
+
+fn linuxfr_session(data: LinuxfrToken, fallback_refresh: &str, login: String) -> LinuxfrSession {
+    LinuxfrSession {
+        access_token: data.access_token,
+        refresh_token: if data.refresh_token.is_empty() {
+            fallback_refresh.to_owned()
+        } else {
+            data.refresh_token
+        },
+        expires_at: if data.expires_in > 0 {
+            chrono::Utc::now().timestamp() + data.expires_in
+        } else {
+            0
+        },
+        login,
+        direct: true,
+    }
+}
+
+async fn fetch_linuxfr_login(
+    client: &reqwest::Client,
+    access_token: &str,
+) -> Result<String, String> {
+    let response = client
+        .get(LINUXFR_ME_URL)
+        .bearer_auth(access_token)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|error| format!("LinuxFR /me : {error}"))?;
+    log_http_response(&response);
+    if !response.status().is_success() {
+        return Err(format!("LinuxFR /me : HTTP {}", response.status()));
+    }
+    let body = read_bounded(response, 64 * 1024)
+        .await
+        .map_err(|error| format!("LinuxFR /me : {error}"))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|error| format!("LinuxFR /me : {error}"))?;
+    Ok(value
+        .get("login")
+        .and_then(|login| login.as_str())
+        .unwrap_or_default()
+        .to_owned())
+}
+
 pub async fn refresh_linuxfr(
     client: &reqwest::Client,
     base_url: &str,
@@ -572,6 +753,7 @@ pub async fn refresh_linuxfr(
         },
         expires_at: chrono::Utc::now().timestamp() + data.expires_in.max(60),
         login: String::new(),
+        direct: false,
     })
 }
 
@@ -1063,7 +1245,91 @@ mod tests {
         assert!(builtin_emoji().iter().any(|item| item.characters == "🦆"));
     }
 
+    #[test]
+    fn builds_linuxfr_authorization_url() {
+        let url = linuxfr_authorize_url("client id", crate::config::LINUXFR_REDIRECT_URI);
+        assert!(url.starts_with("https://linuxfr.org/api/oauth/authorize?"));
+        assert!(url.contains("client_id=client+id"));
+        assert!(url.contains(
+            "redirect_uri=urn%3Aietf%3Awg%3Aoauth%3A2.0%3Aoob"
+        ));
+        assert!(url.contains("scope=account+board"));
+        assert!(url.contains("response_type=code"));
+    }
+
+    #[test]
+    fn extracts_linuxfr_code_from_paste() {
+        assert_eq!(
+            extract_linuxfr_code("  deadbeef  ").as_deref(),
+            Some("deadbeef")
+        );
+        assert_eq!(
+            extract_linuxfr_code("https://example.org/cb?code=abc123&state=x").as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(extract_linuxfr_code("https://example.org/cb?error=nope"), None);
+        assert_eq!(extract_linuxfr_code("   "), None);
+    }
+
+    #[test]
+    fn maps_linuxfr_token_response_to_session() {
+        let data: LinuxfrToken =
+            serde_json::from_str(r#"{"access_token":"a","expires_in":3600}"#).unwrap();
+        let session = linuxfr_session(data, "old-refresh", "dave".into());
+        assert_eq!(session.access_token, "a");
+        assert_eq!(session.refresh_token, "old-refresh");
+        assert!(session.direct);
+        assert!(session.expires_at > chrono::Utc::now().timestamp());
+
+        let data: LinuxfrToken =
+            serde_json::from_str(r#"{"error":"invalid_grant","error_description":"bad"}"#)
+                .unwrap();
+        assert_eq!(data.error, "invalid_grant");
+        assert_eq!(data.error_description, "bad");
+    }
+
+    #[tokio::test]
+    async fn direct_linuxfr_refresh_sends_client_credentials() {
+        let body = br#"{"access_token":"a","refresh_token":"b","expires_in":3600}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes()
+        .into_iter()
+        .chain(body.iter().copied())
+        .collect();
+        let (base, handle) = one_request_with(response).await;
+        let client = client();
+        let data = request_linuxfr_token(
+            &client,
+            &format!("{base}/token"),
+            &[
+                ("client_id", "id"),
+                ("client_secret", "secret"),
+                ("refresh_token", "ref"),
+                ("grant_type", "refresh_token"),
+            ],
+        )
+        .await
+        .expect("token");
+        assert_eq!(data.access_token, "a");
+        assert_eq!(data.refresh_token, "b");
+        let request = handle.await.expect("server");
+        assert!(request.starts_with("POST /token"));
+        assert!(request.contains("client_id=id"));
+        assert!(request.contains("client_secret=secret"));
+        assert!(request.contains("refresh_token=ref"));
+        assert!(request.contains("grant_type=refresh_token"));
+    }
+
     async fn one_request(response: &'static [u8]) -> (String, tokio::task::JoinHandle<String>) {
+        one_request_with(response.to_vec()).await
+    }
+
+    async fn one_request_with(
+        response: Vec<u8>,
+    ) -> (String, tokio::task::JoinHandle<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1074,7 +1340,7 @@ mod tests {
             let mut buffer = vec![0u8; 8192];
             let count = socket.read(&mut buffer).await.expect("read");
             let request = String::from_utf8_lossy(&buffer[..count]).into_owned();
-            socket.write_all(response).await.expect("write");
+            socket.write_all(&response).await.expect("write");
             request
         });
         (format!("http://{address}"), handle)

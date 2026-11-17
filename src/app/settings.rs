@@ -11,7 +11,7 @@ impl App {
             SettingsMessage::Blocked(value) => self.settings.blocked = value,
             SettingsMessage::Plop(value) => self.settings.plop = value,
             SettingsMessage::BlockedMode(mode) => self.settings.blocked_mode = mode,
-            SettingsMessage::ShowHidden(value) => self.settings.show_hidden = value,
+            SettingsMessage::Hungry(value) => self.settings.hungry = value,
             SettingsMessage::Theme(theme) => self.settings.theme = theme,
             SettingsMessage::NotifyEnabled(value) => self.settings.notifications.enabled = value,
             SettingsMessage::NotifyAll(value) => self.settings.notifications.all_posts = value,
@@ -123,6 +123,16 @@ impl App {
                 self.settings.selected_boards.remove(&name);
             }
             SettingsMessage::LinuxfrPaste(value) => self.settings.linuxfr_paste = value,
+            SettingsMessage::LinuxfrClientId(value) => self.settings.linuxfr_client_id = value,
+            SettingsMessage::LinuxfrClientSecret(value) => {
+                self.settings.linuxfr_client_secret = value
+            }
+            SettingsMessage::LinuxfrAuthorize => {
+                tasks.extend(self.start_linuxfr_authorize());
+            }
+            SettingsMessage::LinuxfrConnect => {
+                tasks.extend(self.start_linuxfr_connect());
+            }
             SettingsMessage::Apply => {
                 tasks.extend(self.apply_settings());
             }
@@ -134,6 +144,153 @@ impl App {
         tasks
     }
 
+    /// Open the LinuxFR authorization page. With client credentials, roinroin
+    /// uses LinuxFr's native redirect: LinuxFr displays a code that the user
+    /// pastes back (LinuxFr rejects `http` redirect URIs and an `https` loopback
+    /// would require a self-signed certificate). gb2c remains the fallback.
+    pub(super) fn start_linuxfr_authorize(&mut self) -> Vec<Task<Message>> {
+        let client_id = self.settings.linuxfr_client_id.trim().to_owned();
+        let client_secret = self.settings.linuxfr_client_secret.trim().to_owned();
+        if !client_id.is_empty() && !client_secret.is_empty() {
+            self.linuxfr_oauth_client = Some((client_id.clone(), client_secret));
+            self.settings.error = None;
+            self.settings.info =
+                Some("autorise LinuxFR, puis colle le code affiché dans le champ".into());
+            return vec![Task::done(Message::OpenUrl(net::linuxfr_authorize_url(
+                &client_id,
+                config::LINUXFR_REDIRECT_URI,
+            )))];
+        }
+
+        if let Some(server) = self
+            .settings
+            .servers
+            .iter()
+            .find(|server| server.enabled)
+            .map(|server| server.url.trim_end_matches('/').to_owned())
+        {
+            return vec![Task::done(Message::OpenUrl(format!(
+                "{server}/gb2c/linuxfr/authorize"
+            )))];
+        }
+        self.settings.error = Some(
+            "renseigne l'identifiant et le secret de l'application LinuxFR, \
+             ou active un serveur gb2c"
+                .into(),
+        );
+        Vec::new()
+    }
+
+    /// Exchange the code displayed by LinuxFr for an access token, directly
+    /// against LinuxFr (no gb2c).
+    pub(super) fn start_linuxfr_connect(&mut self) -> Vec<Task<Message>> {
+        if self.linuxfr_connecting {
+            self.settings.error = Some("connexion LinuxFR déjà en cours".into());
+            return Vec::new();
+        }
+        let Some(code) = net::extract_linuxfr_code(&self.settings.linuxfr_paste) else {
+            self.settings.error = Some("colle le code affiché par LinuxFR".into());
+            return Vec::new();
+        };
+        let credentials = self.linuxfr_oauth_client.clone().or_else(|| {
+            let client_id = self.settings.linuxfr_client_id.trim();
+            let client_secret = self.settings.linuxfr_client_secret.trim();
+            if client_id.is_empty() || client_secret.is_empty() {
+                None
+            } else {
+                Some((client_id.to_owned(), client_secret.to_owned()))
+            }
+        });
+        let Some((client_id, client_secret)) = credentials else {
+            self.settings.error = Some(
+                "identifiant et secret de l'application LinuxFR nécessaires pour \
+                 échanger le code"
+                    .into(),
+            );
+            return Vec::new();
+        };
+        self.linuxfr_oauth_client = Some((client_id.clone(), client_secret.clone()));
+        self.linuxfr_connecting = true;
+        self.settings.error = None;
+        self.settings.info = Some("échange du code LinuxFR…".into());
+        let client = self.client.clone();
+        vec![Task::perform(
+            async move {
+                net::exchange_linuxfr_code(
+                    &client,
+                    &client_id,
+                    &client_secret,
+                    &code,
+                    config::LINUXFR_REDIRECT_URI,
+                )
+                .await
+            },
+            Message::LinuxfrAuthorized,
+        )]
+    }
+
+    /// Refresh the LinuxFR token without gb2c when application credentials are
+    /// configured, and fall back to the gb2c endpoint otherwise. The error
+    /// explains which piece is missing.
+    pub(super) fn start_linuxfr_refresh(&mut self) -> Result<Task<Message>, String> {
+        if self.linuxfr_refreshing {
+            return Err("rafraîchissement LinuxFR déjà en cours".into());
+        }
+        let direct = self
+            .config
+            .linuxfr
+            .as_ref()
+            .is_some_and(|session| session.direct);
+        let refresh_token = self
+            .config
+            .linuxfr
+            .as_ref()
+            .map(|session| session.refresh_token.clone())
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| "aucun refresh token LinuxFR".to_owned())?;
+        let client = self.client.clone();
+        if direct {
+            let (client_id, client_secret) = self
+                .config
+                .linuxfr_direct_credentials()
+                .ok_or_else(|| {
+                    "identifiants de l'application LinuxFR manquants pour rafraîchir le jeton"
+                        .to_owned()
+                })?;
+            let client_id = client_id.to_owned();
+            let client_secret = client_secret.to_owned();
+            self.linuxfr_refreshing = true;
+            self.settings.info = Some("rafraîchissement LinuxFR…".into());
+            Ok(Task::perform(
+                async move {
+                    net::refresh_linuxfr_direct(
+                        &client,
+                        &client_id,
+                        &client_secret,
+                        &refresh_token,
+                    )
+                    .await
+                },
+                Message::LinuxfrRefreshed,
+            ))
+        } else if let Some(server) = self
+            .config
+            .servers
+            .iter()
+            .find(|server| server.enabled)
+            .map(|server| server.url.clone())
+        {
+            self.linuxfr_refreshing = true;
+            self.settings.info = Some("rafraîchissement LinuxFR…".into());
+            Ok(Task::perform(
+                async move { net::refresh_linuxfr(&client, &server, &refresh_token).await },
+                Message::LinuxfrRefreshed,
+            ))
+        } else {
+            Err("aucun serveur gb2c pour rafraîchir le jeton LinuxFR".into())
+        }
+    }
+
     pub(super) fn apply_settings(&mut self) -> Vec<Task<Message>> {
         let mut config = self.config.clone();
         config.nickname = self.settings.nickname.trim().to_owned();
@@ -141,10 +298,12 @@ impl App {
         config.blocked = parse_csv(&self.settings.blocked);
         config.plop_list = parse_csv(&self.settings.plop);
         config.blocked_mode = self.settings.blocked_mode;
-        config.show_hidden = self.settings.show_hidden;
+        config.hungry = self.settings.hungry;
         config.notifications = self.settings.notifications.clone();
         config.theme = self.settings.theme;
         config.language = self.settings.language;
+        config.linuxfr_client_id = self.settings.linuxfr_client_id.trim().to_owned();
+        config.linuxfr_client_secret = self.settings.linuxfr_client_secret.trim().to_owned();
         config.selected_boards = self.settings.selected_boards.clone();
         config.hidden_tribunes = self.settings.hidden_tribunes.clone();
         config.custom_boards = self.settings.custom_boards.clone();

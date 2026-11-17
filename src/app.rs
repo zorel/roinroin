@@ -218,7 +218,7 @@ pub struct SettingsDraft {
     pub blocked: String,
     pub plop: String,
     pub blocked_mode: BlockedMode,
-    pub show_hidden: bool,
+    pub hungry: bool,
     pub notifications: NotifyConfig,
     pub theme: ThemeMode,
     pub language: Language,
@@ -234,6 +234,8 @@ pub struct SettingsDraft {
     pub board_info_field: String,
     pub board_oauth: bool,
     pub linuxfr_paste: String,
+    pub linuxfr_client_id: String,
+    pub linuxfr_client_secret: String,
     pub error: Option<String>,
     pub info: Option<String>,
 }
@@ -256,7 +258,7 @@ impl SettingsDraft {
                 .collect::<Vec<_>>()
                 .join(", "),
             blocked_mode: config.blocked_mode,
-            show_hidden: config.show_hidden,
+            hungry: config.hungry,
             notifications: config.notifications.clone(),
             theme: config.theme,
             language: config.language,
@@ -280,6 +282,8 @@ impl SettingsDraft {
             board_info_field: String::new(),
             board_oauth: false,
             linuxfr_paste: String::new(),
+            linuxfr_client_id: config.linuxfr_client_id.clone(),
+            linuxfr_client_secret: config.linuxfr_client_secret.clone(),
             error: None,
             info: None,
         }
@@ -293,7 +297,7 @@ pub enum SettingsMessage {
     Blocked(String),
     Plop(String),
     BlockedMode(BlockedMode),
-    ShowHidden(bool),
+    Hungry(bool),
     Theme(ThemeMode),
     NotifyEnabled(bool),
     NotifyAll(bool),
@@ -317,6 +321,10 @@ pub enum SettingsMessage {
     AddBoard,
     RemoveBoard(String),
     LinuxfrPaste(String),
+    LinuxfrClientId(String),
+    LinuxfrClientSecret(String),
+    LinuxfrAuthorize,
+    LinuxfrConnect,
     Apply,
     Cancel,
 }
@@ -343,8 +351,6 @@ pub enum Message {
     CloseConversation(PostKey),
     ClearSelection,
     JumpTo(PostKey),
-    ToggleBlockedMode,
-    ToggleShowHidden,
     MarkAllRead,
     Scrolled(f32),
     Composer(String),
@@ -392,6 +398,7 @@ pub enum Message {
     TotozHoverImage(String, Result<Vec<u8>, String>),
     LinkFetched(String, Result<net::LinkMetadata, String>),
     TotozFrameTick,
+    LinuxfrAuthorized(Result<LinuxfrSession, String>),
     LinuxfrRefreshed(Result<LinuxfrSession, String>),
     RefreshLinuxfr,
     Info(String),
@@ -422,9 +429,7 @@ impl Message {
             Self::ConversationScrolled(..) => "ConversationScrolled",
             Self::CloseConversation(_) => "CloseConversation",
             Self::ClearSelection => "ClearSelection",
-            Self::JumpTo(_) => "JumpTo",
-            Self::ToggleBlockedMode => "ToggleBlockedMode",
-            Self::ToggleShowHidden => "ToggleShowHidden",
+            Self::JumpTo(..) => "JumpTo",
             Self::MarkAllRead => "MarkAllRead",
             Self::Scrolled(_) => "Scrolled",
             Self::Composer(_) => "Composer",
@@ -472,6 +477,7 @@ impl Message {
             Self::TotozHoverImage(..) => "TotozHoverImage",
             Self::LinkFetched(..) => "LinkFetched",
             Self::TotozFrameTick => "TotozFrameTick",
+            Self::LinuxfrAuthorized(_) => "LinuxfrAuthorized",
             Self::LinuxfrRefreshed(_) => "LinuxfrRefreshed",
             Self::RefreshLinuxfr => "RefreshLinuxfr",
             Self::Info(_) => "Info",
@@ -594,6 +600,8 @@ pub struct App {
     pub(crate) totoz_search_id: Id,
     pub(crate) emoji_search_id: Id,
     pub(crate) linuxfr_refreshing: bool,
+    pub(crate) linuxfr_connecting: bool,
+    pub(crate) linuxfr_oauth_client: Option<(String, String)>,
     pub(crate) sse_epoch: u64,
     pub(crate) linuxfr_retry_at: Option<Instant>,
     pub(crate) sending: bool,
@@ -676,6 +684,8 @@ impl App {
             totoz_search_id: Id::new("roinroin-totoz-search"),
             emoji_search_id: Id::new("roinroin-emoji-search"),
             linuxfr_refreshing: false,
+            linuxfr_connecting: false,
+            linuxfr_oauth_client: None,
             sse_epoch: 0,
             linuxfr_retry_at: None,
             sending: false,
@@ -939,7 +949,7 @@ impl App {
             .info(key)
             .map(|info| info.hidden)
             .unwrap_or(false);
-        !hidden || self.config.show_hidden || self.config.blocked_mode == BlockedMode::Gray
+        !hidden || self.config.blocked_mode == BlockedMode::Gray
     }
 
     pub fn visible_keys(&self) -> Vec<PostKey> {
@@ -1074,10 +1084,7 @@ impl App {
             if info.is_mine {
                 continue;
             }
-            if info.hidden
-                && self.config.blocked_mode == BlockedMode::Hide
-                && !self.config.show_hidden
-            {
+            if info.hidden && self.config.blocked_mode == BlockedMode::Hide {
                 continue;
             }
             unread += 1;

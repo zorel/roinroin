@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use iced::widget::text::Span;
 use iced::widget::{
-    button, checkbox, column, container, image, mouse_area, row, rule, scrollable, span, text,
-    text_input, Space,
+    button, checkbox, column, container, image, mouse_area, radio, row, rule, scrollable, span,
+    text, text_input, Space,
 };
 use iced::{mouse, Alignment, Color, Element, Fill, Font, Length, Vector};
 use unicode_properties::emoji::EmojiStatus;
@@ -15,7 +15,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::app::{
     App, ConnectionStatus, LinkAction, LinkPreview, Message, Screen, SettingsMessage,
 };
-use crate::config::{BlockedMode, BoardAuth, ThemeMode};
+use crate::config::{self, BlockedMode, BoardAuth, ThemeMode};
 use crate::hover_text::HoverRich;
 use crate::message::Token;
 use crate::model::{PostKey, SourceId, TribuneKey};
@@ -1088,7 +1088,10 @@ fn emoji_segments(value: &str) -> Vec<(&str, bool)> {
 }
 
 fn emoji_font() -> Font {
-    Font::with_name("Noto Color Emoji")
+    // The family bundled in `main` (Twemoji Mozilla). Asking for
+    // "Noto Color Emoji" no longer works: current distributions only ship the
+    // COLRv1 build, which swash (the rasterizer behind iced) cannot draw.
+    Font::with_name("Twemoji Mozilla")
 }
 
 fn emoji_rich<'a>(value: impl AsRef<str>) -> iced::widget::text::Rich<'a, (), Message> {
@@ -1252,12 +1255,17 @@ fn totoz_suggestion_label<'a>(name: &str, query: &str) -> Element<'a, Message> {
 
 fn icon_button<'a>(glyph: &'a str, message: Message, top_padding: f32) -> Element<'a, Message> {
     button(
-        container(text(glyph).size(16).style(colors::muted_text))
-            .width(Fill)
-            .height(Fill)
-            .padding(iced::Padding::ZERO.top(top_padding))
-            .center_x(Fill)
-            .center_y(Fill),
+        container(
+            text(glyph)
+                .size(16)
+                .font(emoji_font())
+                .style(colors::muted_text),
+        )
+        .width(Fill)
+        .height(Fill)
+        .padding(iced::Padding::ZERO.top(top_padding))
+        .center_x(Fill)
+        .center_y(Fill),
     )
     .on_press(message)
     .style(colors::button_ghost)
@@ -1400,32 +1408,43 @@ fn settings_view(app: &App) -> Element<'_, Message> {
     ]
     .spacing(6);
 
-    let blocked_mode = row![
-        button(if draft.blocked_mode == BlockedMode::Gray {
-            "Filtrés en gris"
-        } else {
-            "Griser les filtrés"
-        })
-        .on_press(Message::Settings(SettingsMessage::BlockedMode(
-            BlockedMode::Gray
-        )))
-        .style(colors::button_secondary),
-        button(if draft.blocked_mode == BlockedMode::Hide {
-            "Filtrés masqués"
-        } else {
-            "Masquer les filtrés"
-        })
-        .on_press(Message::Settings(SettingsMessage::BlockedMode(
-            BlockedMode::Hide
-        )))
-        .style(colors::button_secondary),
-        checkbox(draft.show_hidden)
-            .label("Afficher aussi les posts masqués")
-            .on_toggle(|value| Message::Settings(SettingsMessage::ShowHidden(value)))
-            .size(16),
+    let blocked_mode = column![
+        text("Affichage des posts filtrés").size(12),
+        radio(
+            "Garder la ligne, en gris",
+            BlockedMode::Gray,
+            Some(draft.blocked_mode),
+            |mode| Message::Settings(SettingsMessage::BlockedMode(mode)),
+        )
+        .size(16)
+        .text_size(13),
+        setting_help(
+            "Les posts filtrés restent dans la tribune ; leur texte est remplacé par \
+             « [message masqué] »."
+        ),
+        radio(
+            "Masquer la ligne",
+            BlockedMode::Hide,
+            Some(draft.blocked_mode),
+            |mode| Message::Settings(SettingsMessage::BlockedMode(mode)),
+        )
+        .size(16)
+        .text_size(13),
+        setting_help("Les posts filtrés disparaissent de la tribune."),
     ]
-    .spacing(8)
-    .align_y(Alignment::Center);
+    .spacing(4);
+
+    let hungry = column![
+        checkbox(draft.hungry)
+            .label("Bàk hungry")
+            .on_toggle(|value| Message::Settings(SettingsMessage::Hungry(value)))
+            .size(16),
+        setting_help(
+            "Enlève aussi les réponses aux posts filtrés. Sans hungry, seuls les posts \
+             de l'identité bloquée sont filtrés."
+        ),
+    ]
+    .spacing(4);
 
     let notifications = column![
         row![
@@ -1459,25 +1478,26 @@ fn settings_view(app: &App) -> Element<'_, Message> {
 
     let linuxfr = column![
         row![
-            text_input("jeton ou URL de retour LinuxFR", &draft.linuxfr_paste)
-                .on_input(|value| Message::Settings(SettingsMessage::LinuxfrPaste(value)))
-                .width(Fill)
-                .style(colors::text_input_style),
+            text_input(
+                "code affiché par LinuxFR, jeton ou URL de retour",
+                &draft.linuxfr_paste
+            )
+            .on_input(|value| Message::Settings(SettingsMessage::LinuxfrPaste(value)))
+            .width(Fill)
+            .style(colors::text_input_style),
             button("Ouvrir l'autorisation")
-                .on_press(Message::OpenUrl(
-                    app.config
-                        .servers
-                        .iter()
-                        .find(|server| server.enabled)
-                        .map(|server| {
-                            format!(
-                                "{}/gb2c/linuxfr/authorize",
-                                server.url.trim_end_matches('/')
-                            )
-                        })
-                        .unwrap_or_default(),
-                ))
+                .on_press(Message::Settings(SettingsMessage::LinuxfrAuthorize))
                 .style(colors::button_secondary),
+            button(if app.linuxfr_connecting {
+                "Connexion…"
+            } else {
+                "Connecter le code"
+            })
+            .on_press_maybe(
+                (!app.linuxfr_connecting)
+                    .then_some(Message::Settings(SettingsMessage::LinuxfrConnect)),
+            )
+            .style(colors::button_secondary),
             button("Rafraîchir")
                 .on_press(Message::RefreshLinuxfr)
                 .style(colors::button_ghost),
@@ -1485,8 +1505,46 @@ fn settings_view(app: &App) -> Element<'_, Message> {
         .spacing(6)
         .align_y(Alignment::Center),
         text(
-            "gb2c ne peut pas renvoyer le jeton au client : ouvre la page d'autorisation, \
-             puis colle ici l'URL de retour (ou le jeton) pour que roinroin puisse poster sur LinuxFR."
+            "Sans gb2c : crée une application sur https://linuxfr.org/api/applications \
+             avec l'adresse de redirection native ci-dessous, puis colle son identifiant \
+             et son secret ici. LinuxFr refuse les redirections http et une boucle locale \
+             https exigerait un certificat : après autorisation, LinuxFr affiche un code \
+             à coller dans le champ puis « Connecter le code »."
+        )
+        .size(10)
+        .style(colors::muted_text),
+        row![
+            text("Redirection native")
+                .width(Length::Fixed(120.0))
+                .size(11),
+            emoji_rich(config::LINUXFR_REDIRECT_URI)
+                .size(10)
+                .style(colors::muted_text)
+                .width(Fill),
+            button("Copier")
+                .on_press(Message::CopySelection(
+                    config::LINUXFR_REDIRECT_URI.to_owned(),
+                ))
+                .style(colors::button_ghost),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+        row![
+            text_input("identifiant d'application", &draft.linuxfr_client_id)
+                .on_input(|value| Message::Settings(SettingsMessage::LinuxfrClientId(value)))
+                .width(Length::Fixed(230.0))
+                .style(colors::text_input_style),
+            text_input("secret d'application", &draft.linuxfr_client_secret)
+                .on_input(|value| Message::Settings(SettingsMessage::LinuxfrClientSecret(value)))
+                .secure(true)
+                .width(Fill)
+                .style(colors::text_input_style),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+        text(
+            "Le jeton et le secret restent dans la configuration locale (droits 0600). \
+             Sans identifiant et secret, l'autorisation passe par le serveur gb2c."
         )
         .size(10)
         .style(colors::muted_text),
@@ -1620,11 +1678,10 @@ fn settings_view(app: &App) -> Element<'_, Message> {
             column![board_list, add_board].spacing(10),
         ))
         .push(section(
-            "Filtrage",
+            "Boitakon (bàk)",
             column![
-                blocked_mode,
                 row![
-                    text("Identités bloquées").width(Length::Fixed(160.0)),
+                    text("Identités bloquées").width(Length::Fixed(170.0)),
                     text_input("pseudo1, pseudo2, …", &draft.blocked)
                         .on_input(|value| Message::Settings(SettingsMessage::Blocked(value)))
                         .width(Fill)
@@ -1632,13 +1689,23 @@ fn settings_view(app: &App) -> Element<'_, Message> {
                 ]
                 .align_y(Alignment::Center),
                 row![
-                    text("Liste plop").width(Length::Fixed(160.0)),
+                    text("Liste plop").width(Length::Fixed(170.0)),
                     text_input("auteurs remplacés par plop/pika/prout", &draft.plop)
                         .on_input(|value| Message::Settings(SettingsMessage::Plop(value)))
                         .width(Fill)
                         .style(colors::text_input_style),
                 ]
                 .align_y(Alignment::Center),
+                text(
+                    "La bàk filtre les posts des identités bloquées. Hungry, elle filtre \
+                     aussi toutes les réponses qui en découlent. La liste plop remplace \
+                     seulement le texte des messages."
+                )
+                .size(11)
+                .style(colors::muted_text),
+                rule::horizontal(1).style(colors::rule),
+                hungry,
+                blocked_mode,
             ]
             .spacing(8),
         ))
@@ -1682,6 +1749,17 @@ fn section<'a>(title: &'a str, content: impl Into<Element<'a, Message>>) -> Elem
     .style(colors::panel)
     .padding(14)
     .width(Fill)
+    .into()
+}
+
+/// Muted explanation aligned with a setting's control label.
+fn setting_help<'a>(label: &'a str) -> Element<'a, Message> {
+    container(
+        text(label)
+            .size(11)
+            .style(colors::muted_text),
+    )
+    .padding(iced::Padding::ZERO.left(24))
     .into()
 }
 

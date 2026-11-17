@@ -1,5 +1,41 @@
 # Journal des modifications
 
+## [0.5.0] - 2026-11-17
+
+### Ajouts
+
+- authentification OAuth2 LinuxFR **directe**, sans serveur gb2c : renseigner
+  l'identifiant et le secret d'une application LinuxFR dans les réglages, le
+  client ouvre la page d'autorisation, récupère le code affiché par LinuxFr
+  (redirection native `urn:ietf:wg:oauth:2.0:oob`, car LinuxFr refuse les
+  redirections http), échange ce code et rafraîchit ensuite le jeton
+  directement sur `linuxfr.org` ; gb2c reste le repli quand aucun identifiant
+  d'application n'est configuré.
+
+### Modifications
+
+- le réglage de filtrage devient la **boitakon (bàk)** : deux choix explicites,
+  « Garder la ligne, en gris » et « Masquer la ligne », remplacent les boutons
+  qui changeaient de libellé ; la case « Afficher aussi les posts masqués »,
+  sans effet réel et redondante avec le mode gris, est supprimée ;
+- l'option `hungry` de la bàk filtre aussi les réponses aux posts filtrés ;
+  sans elle, seuls les posts de l'identité bloquée sont filtrés. `hungry`
+  vaut `true` par défaut, ce qui conserve le comportement précédent.
+
+### Corrections
+
+- les posts qui répondent avec une horloge courte (`HH:mm`) à l'un de nos
+  posts sont désormais reconnus comme des réponses : ils rejoignent le fil de
+  discussion et déclenchent le badge, la notification et le marqueur `↩` ; une
+  horloge courte pointant vers le post d'un autre auteur reste une simple
+  norloge navigable, trop ambiguë pour créer une arête ;
+- les emojis et l'icône de recherche s'affichent à nouveau : les
+  distributions récentes ne fournissent plus qu'une police emoji COLRv1
+  (`Noto Color Emoji`), format que le moteur de rendu d'iced ne sait pas
+  tracer ; une police couleur COLRv0 (Twemoji Mozilla) est désormais
+  embarquée dans le binaire et utilisée pour les emojis, les drapeaux, les
+  pastilles et les boutons d'interface.
+
 ## [0.4.1] - 2026-11-07
 
 ### Corrections

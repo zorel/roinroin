@@ -54,26 +54,16 @@ impl App {
                     && self
                         .linuxfr_retry_at
                         .is_none_or(|retry| Instant::now() >= retry)
+                    && self.config.linuxfr.as_ref().is_some_and(|session| {
+                        session.is_expired() && !session.refresh_token.is_empty()
+                    })
                 {
-                    if let Some(session) = self.config.linuxfr.as_ref() {
-                        if session.is_expired() && !session.refresh_token.is_empty() {
-                            if let Some(server) = self
-                                .config
-                                .servers
-                                .iter()
-                                .find(|server| server.enabled)
-                                .map(|server| server.url.clone())
-                            {
-                                self.linuxfr_refreshing = true;
-                                let client = self.client.clone();
-                                let refresh = session.refresh_token.clone();
-                                tasks.push(Task::perform(
-                                    async move {
-                                        net::refresh_linuxfr(&client, &server, &refresh).await
-                                    },
-                                    Message::LinuxfrRefreshed,
-                                ));
-                            }
+                    match self.start_linuxfr_refresh() {
+                        Ok(task) => tasks.push(task),
+                        Err(error) => {
+                            self.linuxfr_retry_at =
+                                Some(Instant::now() + Duration::from_secs(300));
+                            self.settings.error = Some(error);
                         }
                     }
                 }
@@ -419,21 +409,6 @@ impl App {
                         iced::widget::scrollable::RelativeOffset { x: 0.0, y },
                     ));
                 }
-            }
-            Message::ToggleBlockedMode => {
-                self.config.blocked_mode = match self.config.blocked_mode {
-                    BlockedMode::Hide => BlockedMode::Gray,
-                    BlockedMode::Gray => BlockedMode::Hide,
-                };
-                self.settings.blocked_mode = self.config.blocked_mode;
-                self.analysis_dirty = true;
-                self.save_config_quietly();
-            }
-            Message::ToggleShowHidden => {
-                self.config.show_hidden = !self.config.show_hidden;
-                self.settings.show_hidden = self.config.show_hidden;
-                self.analysis_dirty = true;
-                self.save_config_quietly();
             }
             Message::MarkAllRead => {
                 for tribune in self.tribunes() {
@@ -952,34 +927,39 @@ impl App {
                         .linuxfr_retry_at
                         .is_none_or(|retry| Instant::now() >= retry)
                 {
-                    let refresh = self
-                        .config
-                        .linuxfr
-                        .as_ref()
-                        .map(|session| session.refresh_token.clone())
-                        .filter(|token| !token.is_empty());
-                    let server = self
-                        .config
-                        .servers
-                        .iter()
-                        .find(|server| server.enabled)
-                        .map(|server| server.url.clone());
-                    match (refresh, server) {
-                        (Some(refresh), Some(server)) => {
-                            self.linuxfr_refreshing = true;
-                            self.settings.info = Some("rafraîchissement LinuxFR…".into());
-                            let client = self.client.clone();
-                            tasks.push(Task::perform(
-                                async move {
-                                    net::refresh_linuxfr(&client, &server, &refresh).await
-                                },
-                                Message::LinuxfrRefreshed,
-                            ));
+                    match self.start_linuxfr_refresh() {
+                        Ok(task) => tasks.push(task),
+                        Err(error) => self.settings.error = Some(error),
+                    }
+                }
+            }
+            Message::LinuxfrAuthorized(result) => {
+                self.linuxfr_connecting = false;
+                match result {
+                    Ok(mut session) => {
+                        if session.login.is_empty() {
+                            if let Some(previous) = self.config.linuxfr.as_ref() {
+                                session.login = previous.login.clone();
+                            }
                         }
-                        _ => {
-                            self.settings.error =
-                                Some("aucun refresh token LinuxFR ou aucun serveur gb2c".into());
+                        self.config.linuxfr = Some(session);
+                        if let Some((client_id, client_secret)) =
+                            self.linuxfr_oauth_client.take()
+                        {
+                            self.config.linuxfr_client_id = client_id.clone();
+                            self.config.linuxfr_client_secret = client_secret.clone();
+                            self.settings.linuxfr_client_id = client_id;
+                            self.settings.linuxfr_client_secret = client_secret;
                         }
+                        self.settings.linuxfr_paste.clear();
+                        self.linuxfr_retry_at = None;
+                        self.settings.info = Some("connecté à LinuxFR".into());
+                        self.save_config_quietly();
+                    }
+                    Err(error) => {
+                        self.linuxfr_oauth_client = None;
+                        self.settings.error = Some(error.clone());
+                        self.error = Some(error);
                     }
                 }
             }

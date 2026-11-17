@@ -55,6 +55,7 @@ jobs:
           cp "target/${TARGET}/release/roinroin" "dist/${PACKAGE}/"
           cp README.md CHANGELOG.md LICENSE roinroin.example.toml "dist/${PACKAGE}/"
           cp assets/roinroin.desktop assets/roinroin.svg "dist/${PACKAGE}/"
+          cp assets/TwemojiMozilla.LICENSE.md "dist/${PACKAGE}/"
           tar -czf "dist/${PACKAGE}.tar.gz" -C "dist/${PACKAGE}" .
 
       - name: Upload artifact

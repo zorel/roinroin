@@ -3,8 +3,10 @@
 //!
 //! gb3 references another post with its clock (`12:34:56`, optionally suffixed
 //! by `@tribune`). Posts sharing the same second are disambiguated by the
-//! indice suffix (`^2`, `²`, …). The graph is only built from unambiguous
-//! full-clock references and id references, like gc2 and gb3tui.
+//! indice suffix (`^2`, `²`, …). The graph is built from full, dated and
+//! second-precision clocks plus id references; a minute-only clock (`12:34`)
+//! is too ambiguous to group arbitrary posts, but counts as a reply when it
+//! resolves to one of our own earlier posts.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -102,6 +104,7 @@ pub struct TribuneStats {
 pub fn analyze(
     posts: &BTreeMap<PostKey, Post>,
     blocked: &BTreeSet<String>,
+    hungry: bool,
     my_identities: &BTreeSet<String>,
     now: NaiveDateTime,
 ) -> Analysis {
@@ -180,6 +183,13 @@ pub fn analyze(
         resolved_by_key.insert(key.clone(), resolved);
     }
 
+    let mut is_mine_by_key: HashMap<PostKey, bool> = HashMap::new();
+    for (key, post) in posts {
+        let mine = (!post.info.trim().is_empty() && my_identities.contains(post.info.trim()))
+            || (!post.login.trim().is_empty() && my_identities.contains(post.login.trim()));
+        is_mine_by_key.insert(key.clone(), mine);
+    }
+
     let mut parents_by_child: HashMap<PostKey, BTreeSet<PostKey>> = HashMap::new();
     let mut children_by_parent: HashMap<PostKey, BTreeSet<PostKey>> = HashMap::new();
     for (key, resolved) in &resolved_by_key {
@@ -192,15 +202,24 @@ pub fn analyze(
                 continue;
             }
             let reference = &parsed.norloges[item.reference_index];
-            // Short references are useful for jumping, but too ambiguous to
-            // draw reply edges. gc2 only groups by full clocks.
+            // Full, dated, second-precision and id references are precise
+            // enough to draw reply edges. A minute-only clock is too
+            // ambiguous to group arbitrary discussions, but when it lands on
+            // one of our own earlier posts it is an answer to us: count it so
+            // badges, notifications and followed threads include it.
             let authoritative = matches!(
                 reference.kind,
                 NorlogeKind::FullDateTime(_)
                     | NorlogeKind::DateClock { .. }
                     | NorlogeKind::Clock(_)
                     | NorlogeKind::Id(_)
-            );
+            ) || (matches!(reference.kind, NorlogeKind::Short(_))
+                && is_mine_by_key.get(target).copied().unwrap_or(false)
+                && posts[target]
+                    .time()
+                    .naive
+                    .zip(posts[key].time().naive)
+                    .is_some_and(|(target_time, post_time)| target_time <= post_time));
             if !authoritative {
                 continue;
             }
@@ -215,7 +234,8 @@ pub fn analyze(
         }
     }
 
-    // Blocked identities propagate to every direct or indirect reply.
+    // A hungry bàk propagates blocked identities to every direct or indirect
+    // reply; a normal bàk only filters the blocked identity's own posts.
     let mut hidden: HashSet<PostKey> = HashSet::new();
     let mut queue: Vec<PostKey> = Vec::new();
     for (key, post) in posts {
@@ -224,21 +244,16 @@ pub fn analyze(
             queue.push(key.clone());
         }
     }
-    while let Some(parent) = queue.pop() {
-        if let Some(children) = children_by_parent.get(&parent) {
-            for child in children {
-                if hidden.insert(child.clone()) {
-                    queue.push(child.clone());
+    if hungry {
+        while let Some(parent) = queue.pop() {
+            if let Some(children) = children_by_parent.get(&parent) {
+                for child in children {
+                    if hidden.insert(child.clone()) {
+                        queue.push(child.clone());
+                    }
                 }
             }
         }
-    }
-
-    let mut is_mine_by_key: HashMap<PostKey, bool> = HashMap::new();
-    for (key, post) in posts {
-        let mine = (!post.info.trim().is_empty() && my_identities.contains(post.info.trim()))
-            || (!post.login.trim().is_empty() && my_identities.contains(post.login.trim()));
-        is_mine_by_key.insert(key.clone(), mine);
     }
 
     let my_identity_set: BTreeSet<String> = my_identities
@@ -388,12 +403,18 @@ fn resolve_reference(
         }
         NorlogeKind::Short(clock) => {
             let minute_key = format!("{:02}{:02}", clock.hour(), clock.minute());
-            let same_day = by_minute
+            // The referring post shares its own minute. It must not resolve
+            // to itself: when a reply says `HH:mm` during that very minute,
+            // the intended target is the earlier post, not the reply.
+            let same_day: Vec<PostKey> = by_minute
                 .get(&(target_tribune.clone(), post_time.date(), minute_key.clone()))
                 .cloned()
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|candidate| candidate != key)
+                .collect();
             if !same_day.is_empty() {
-                same_day
+                select_past_or_future(same_day, post_time, posts)
             } else {
                 let mut found = Vec::new();
                 for (tribune, date, candidate_minute) in by_minute.keys() {
@@ -406,6 +427,7 @@ fn resolve_reference(
                         );
                     }
                 }
+                found.retain(|candidate| candidate != key);
                 sort_candidates(&mut found, posts);
                 select_past_or_future(found, post_time, posts)
             }
@@ -570,6 +592,7 @@ mod tests {
         let analysis = analyze(
             &posts,
             &BTreeSet::new(),
+            true,
             &BTreeSet::new(),
             chrono::NaiveDate::from_ymd_opt(2024, 6, 29)
                 .unwrap()
@@ -618,6 +641,7 @@ mod tests {
         let analysis = analyze(
             &posts,
             &BTreeSet::new(),
+            true,
             &BTreeSet::new(),
             chrono::NaiveDate::from_ymd_opt(2024, 6, 29)
                 .unwrap()
@@ -655,6 +679,7 @@ mod tests {
         let analysis = analyze(
             &posts,
             &BTreeSet::new(),
+            true,
             &BTreeSet::new(),
             chrono::NaiveDate::from_ymd_opt(2024, 6, 29)
                 .unwrap()
@@ -677,6 +702,7 @@ mod tests {
         let analysis = analyze(
             &posts,
             &BTreeSet::new(),
+            true,
             &BTreeSet::new(),
             chrono::NaiveDate::from_ymd_opt(2024, 6, 29)
                 .unwrap()
@@ -690,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn propagates_hidden_to_replies() {
+    fn hungry_bak_propagates_hidden_to_replies() {
         let mut posts = BTreeMap::new();
         let (a, pa) = post("t", 1, "20240629120000", "troll", "hello");
         let (b, pb) = post("t", 2, "20240629120100", "bob", "12:00:00 hi");
@@ -700,6 +726,7 @@ mod tests {
         let analysis = analyze(
             &posts,
             &blocked,
+            true,
             &BTreeSet::new(),
             chrono::NaiveDate::from_ymd_opt(2024, 6, 29)
                 .unwrap()
@@ -707,6 +734,28 @@ mod tests {
                 .unwrap(),
         );
         assert!(analysis.posts[&b].hidden);
+    }
+
+    #[test]
+    fn normal_bak_only_filters_blocked_posts() {
+        let mut posts = BTreeMap::new();
+        let (a, pa) = post("t", 1, "20240629120000", "troll", "hello");
+        let (b, pb) = post("t", 2, "20240629120100", "bob", "12:00:00 hi");
+        posts.insert(a.clone(), pa);
+        posts.insert(b.clone(), pb);
+        let blocked = BTreeSet::from(["troll".to_owned()]);
+        let analysis = analyze(
+            &posts,
+            &blocked,
+            false,
+            &BTreeSet::new(),
+            chrono::NaiveDate::from_ymd_opt(2024, 6, 29)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap(),
+        );
+        assert!(analysis.posts[&a].hidden);
+        assert!(!analysis.posts[&b].hidden);
     }
 
     #[test]
@@ -720,6 +769,7 @@ mod tests {
         let analysis = analyze(
             &posts,
             &BTreeSet::new(),
+            true,
             &identities,
             chrono::NaiveDate::from_ymd_opt(2024, 6, 29)
                 .unwrap()
@@ -740,6 +790,7 @@ mod tests {
         let analysis = analyze(
             &posts,
             &BTreeSet::new(),
+            true,
             &BTreeSet::new(),
             chrono::NaiveDate::from_ymd_opt(2024, 6, 29)
                 .unwrap()
@@ -747,6 +798,78 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(analysis.posts[&b].refs[0].target, Some(a));
+    }
+
+    #[test]
+    fn short_clock_reference_to_own_post_builds_reply_edge() {
+        let mut posts = BTreeMap::new();
+        let (mine, mine_post) = post("t", 1, "20240629120000", "dave", "hello");
+        let (reply, reply_post) = post("t", 2, "20240629120030", "bob", "12:00 merci");
+        posts.insert(mine.clone(), mine_post);
+        posts.insert(reply.clone(), reply_post);
+        let identities = BTreeSet::from(["dave".to_owned()]);
+        let analysis = analyze(
+            &posts,
+            &BTreeSet::new(),
+            true,
+            &identities,
+            chrono::NaiveDate::from_ymd_opt(2024, 6, 29)
+                .unwrap()
+                .and_hms_opt(12, 2, 0)
+                .unwrap(),
+        );
+        assert_eq!(analysis.posts[&reply].refs[0].target, Some(mine.clone()));
+        assert!(analysis.posts[&reply].parents.contains(&mine));
+        assert!(analysis.posts[&reply].is_reply);
+        assert_eq!(analysis.conversation_root(&reply), mine);
+        assert_eq!(analysis.conversation(&reply), vec![mine, reply]);
+    }
+
+    #[test]
+    fn short_clock_reference_to_someone_else_does_not_build_reply_edge() {
+        let mut posts = BTreeMap::new();
+        let (other, other_post) = post("t", 1, "20240629120000", "eve", "hello");
+        let (reply, reply_post) = post("t", 2, "20240629120100", "bob", "12:00 merci");
+        posts.insert(other.clone(), other_post);
+        posts.insert(reply.clone(), reply_post);
+        let identities = BTreeSet::from(["dave".to_owned()]);
+        let analysis = analyze(
+            &posts,
+            &BTreeSet::new(),
+            true,
+            &identities,
+            chrono::NaiveDate::from_ymd_opt(2024, 6, 29)
+                .unwrap()
+                .and_hms_opt(12, 2, 0)
+                .unwrap(),
+        );
+        assert_eq!(analysis.posts[&reply].refs[0].target, Some(other));
+        assert!(analysis.posts[&reply].parents.is_empty());
+        assert!(!analysis.posts[&reply].is_reply);
+        assert_eq!(analysis.conversation_root(&reply), reply);
+    }
+
+    #[test]
+    fn short_clock_reference_does_not_reply_to_a_future_own_post() {
+        let mut posts = BTreeMap::new();
+        let (later, later_post) = post("t", 1, "20240629120050", "dave", "later");
+        let (reply, reply_post) = post("t", 2, "20240629120010", "bob", "12:00 merci");
+        posts.insert(later.clone(), later_post);
+        posts.insert(reply.clone(), reply_post);
+        let identities = BTreeSet::from(["dave".to_owned()]);
+        let analysis = analyze(
+            &posts,
+            &BTreeSet::new(),
+            true,
+            &identities,
+            chrono::NaiveDate::from_ymd_opt(2024, 6, 29)
+                .unwrap()
+                .and_hms_opt(12, 2, 0)
+                .unwrap(),
+        );
+        assert_eq!(analysis.posts[&reply].refs[0].target, Some(later));
+        assert!(analysis.posts[&reply].parents.is_empty());
+        assert!(!analysis.posts[&reply].is_reply);
     }
 
     #[test]
@@ -759,6 +882,7 @@ mod tests {
         let analysis = analyze(
             &posts,
             &BTreeSet::new(),
+            true,
             &BTreeSet::new(),
             chrono::NaiveDate::from_ymd_opt(2024, 11, 2)
                 .unwrap()
@@ -800,7 +924,7 @@ mod stats_tests {
             .unwrap()
             .and_hms_opt(15, 7, 0)
             .unwrap();
-        let analysis = analyze(&posts, &BTreeSet::new(), &BTreeSet::new(), now);
+        let analysis = analyze(&posts, &BTreeSet::new(), true, &BTreeSet::new(), now);
         let stats = stats(
             &analysis,
             &posts,
